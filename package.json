@@ -1,0 +1,45 @@
+{
+  "name": "the-ventriana-question",
+  "version": "0.1.0",
+  "description": "Ventriana Sorunu (The Ventrian Question): LLM nation simulation in the world of Aldoria",
+  "type": "module",
+  "bin": {
+    "sim": "./src/cli/index.ts"
+  },
+  "scripts": {
+    "sim": "bun run src/cli/index.ts",
+    "dev:server": "bun run src/cli/index.ts serve --live",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/unit tests/scenarios tests/property tests/contract tests/determinism",
+    "test:all": "bun test",
+    "test:e2e": "bunx playwright test"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^1.2.0",
+    "@elysiajs/cors": "^1.2.0",
+    "@elysiajs/static": "^1.2.0",
+    "ai": "^4.2.0",
+    "commander": "^13.1.0",
+    "elysia": "^1.2.0",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/bun": "^1.2.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "lucide-react": "^0.475.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.1",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vite-plugin-singlefile": "^2.0.3"
+  }
+}

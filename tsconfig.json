@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "types": ["bun-types"]
+  },
+  "include": [
+    "contracts/**/*.ts",
+    "src/**/*.ts",
+    "web/src/**/*.ts",
+    "web/src/**/*.tsx",
+    "tests/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "runs"]
+}

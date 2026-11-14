@@ -1,0 +1,131 @@
+# World of Aldoria (SPEC §3, §4.2, §4.3)
+world_name: Aldoria
+
+countries:
+  lyria:
+    name: Lyria
+    native_nation: lyrians
+    exists_at_start: true
+  skalia:
+    name: Skalia
+    native_nation: skalians
+    exists_at_start: true
+  ventriana:
+    name: Ventriana
+    native_nation: ventrians
+    exists_at_start: false
+
+regions:
+  - id: marenth
+    name: Marenth
+    initial_country: lyria
+    former_ventriana: false
+    is_capital: false
+  - id: oslen
+    name: Oslen
+    initial_country: lyria
+    former_ventriana: false
+    is_capital: false
+  - id: virel
+    name: Virel
+    initial_country: lyria
+    former_ventriana: false
+    is_capital: false
+  - id: teshar
+    name: Teshar
+    initial_country: lyria
+    former_ventriana: true
+    is_capital: false
+  - id: brenholt
+    name: Brenholt
+    initial_country: skalia
+    former_ventriana: false
+    is_capital: false
+  - id: kasvar
+    name: Kasvar
+    initial_country: skalia
+    former_ventriana: false
+    is_capital: false
+  - id: illith
+    name: Illith
+    initial_country: skalia
+    former_ventriana: false
+    is_capital: false
+  - id: veradon
+    name: Veradon
+    initial_country: skalia
+    former_ventriana: true
+    is_capital: true
+  - id: tormund
+    name: Tormund
+    initial_country: skalia
+    former_ventriana: true
+    is_capital: false
+
+# Per-nation syllable lists for unique procedural names (SPEC §4.2)
+syllables:
+  lyrians:
+    first: [Ae, Ly, Va, Ser, Mir, Cal, El, Ori, Thal,Syl, Cor, Fen]
+    middle: [ra, ri, la, len, ven, mar, del, thar, sor, val]
+    last: [is, on, ia, en, ar, eth, or, as, il, an]
+  skalians:
+    first: [Sk, Br, Kor, Tor, Grim, Hal, Vor, Drak,Ulf, Rag, Sten, Myr]
+    middle: [ar, ur, en, ol, rik, var, hold, gar, dak, ven]
+    last: [son, berg, gard, mark, heim, stein, vik, dal, thor, kro]
+  ventrians:
+    first: [Ven, Tes, Ver, Ash, Sol, Zar, Kael, Nyr, Dar, Mal, Cas, Ryn]
+    middle: [tr, ad, ar, esh, an, ir, os, el, ak, um]
+    last: [ia, on, ar, is, en, at, ul, em, ix, or]
+
+# Random seed-trait pools for Genesis backstories (SPEC §4.3)
+seed_traits:
+  jobs:
+    - stonemason
+    - archivist
+    - ferryman
+    - herbalist
+    - weaver
+    - blacksmith
+    - clockmaker
+    - street musician
+    - baker
+    - cartographer
+    - glassblower
+    - apothecary
+    - courier
+    - woodcarver
+    - astronomer
+    - potter
+    - printer
+    - herbal trader
+    - lantern-keeper
+    - scribe
+  family_details:
+    - raised by an older sibling after the war
+    - eldest of four children in a cramped workshop
+    - child of a mixed-region marriage
+    - grew up listening to a grandparent's old ballads
+    - lost an uncle during the border marches
+    - comes from a long line of quiet artisans
+    - orphaned young and mentored by a neighborhood elder
+    - has a twin living in another province
+    - estranged from a strict parent
+    - fiercely protective of a younger cousin
+  fears:
+    - being silenced or forgotten
+    - another sudden border closure separating families
+    - losing their livelihood to political upheaval
+    - dying without leaving anything behind
+    - crowds turning against minorities
+    - official histories erasing what really happened
+    - being trapped in one region forever
+    - betrayal by someone they trusted
+  hopes:
+    - seeing a lasting peace across all nine regions
+    - leaving behind a song or book people remember
+    - rising to lead and reform the laws
+    - finding a place where their people feel safe
+    - uniting neighbors across old rivalries
+    - proving that ordinary citizens can shape history
+    - preserving the true stories of the past
+    - building a movement that outlives them
