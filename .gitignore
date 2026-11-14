@@ -1,0 +1,32 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Simulation outputs & databases
+runs/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
+
+# Dependencies & build outputs
+node_modules/
+dist/
+build/
+.vite/
+out/
+
+# Test & coverage artifacts
+coverage/
+playwright-report/
+test-results/
+.nyc_output/
+
+# Python / OS / Editor caches
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+*.log
