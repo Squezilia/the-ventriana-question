@@ -18,6 +18,8 @@ export interface GeminiClientOptions {
 }
 
 function isSafetyBlockError(err: unknown): boolean {
+  const anyErr = err as { finishReason?: string; message?: string };
+  if (anyErr?.finishReason === "content-filter") return true;
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
   return (

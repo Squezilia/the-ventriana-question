@@ -151,4 +151,79 @@ describe("Layer 5 — Determinism & Replay Tests", () => {
       fs.rmSync(dirRes, { recursive: true, force: true });
     }
   });
+
+  test("live pause, stepOnePhase, and resume produces identical state hash without duplicating phases", async () => {
+    const { config, world } = loadConfig();
+    config.MOCK_LLM = true;
+    config.SIM_SEED = 123;
+    const prompts = new PromptLoader("en", "default");
+
+    const dirFull = fs.mkdtempSync(path.join(os.tmpdir(), "ventriana-step-full-"));
+    const dirStep = fs.mkdtempSync(path.join(os.tmpdir(), "ventriana-step-live-"));
+
+    try {
+      const storeFull = new RunStore(dirFull);
+      const llmFull = new MockLLMClient(123);
+      const sFull = await initializeWorld({
+        config,
+        world,
+        llm: llmFull,
+        prompts,
+        emitEvent: (ev) => storeFull.appendEvent(ev),
+        logLLM: (e) => storeFull.appendLLMCall(e),
+      });
+      const rFull = new SimulationRunner({
+        state: sFull,
+        config,
+        world,
+        llm: llmFull,
+        prompts,
+        storage: storeFull,
+      });
+      await rFull.runDays(3);
+      const hashFull = hashWorldState(rFull.state);
+      storeFull.close();
+
+      // Now run with pause -> stepOnePhase x2 -> resume
+      const storeStep = new RunStore(dirStep);
+      const replayLlm = new ReplayLLMClient(path.join(dirFull, "llm_calls.jsonl"));
+      const sStep = await initializeWorld({
+        config,
+        world,
+        llm: replayLlm,
+        prompts,
+        emitEvent: (ev) => storeStep.appendEvent(ev),
+        logLLM: (e) => storeStep.appendLLMCall(e),
+      });
+      const rStep = new SimulationRunner({
+        state: sStep,
+        config,
+        world,
+        llm: replayLlm,
+        prompts,
+        storage: storeStep,
+      });
+
+      rStep.pause();
+      const runPromise = rStep.runDays(3);
+      // Let event loop enter waitIfPaused()
+      await new Promise((r) => setTimeout(r, 10));
+      await rStep.stepOnePhase(); // day 0 rollover
+      expect(rStep.state.day).toBe(0);
+      expect(rStep.state.phase).toBe("rollover");
+      await rStep.stepOnePhase(); // day 0 morning
+      expect(rStep.state.day).toBe(0);
+      expect(rStep.state.phase).toBe("morning");
+      rStep.resume();
+      const outcome = await runPromise;
+      expect(outcome.completed).toBe(true);
+
+      const hashStep = hashWorldState(rStep.state);
+      storeStep.close();
+      expect(hashStep).toBe(hashFull);
+    } finally {
+      fs.rmSync(dirFull, { recursive: true, force: true });
+      fs.rmSync(dirStep, { recursive: true, force: true });
+    }
+  });
 });

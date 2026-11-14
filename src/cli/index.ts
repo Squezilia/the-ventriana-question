@@ -281,7 +281,20 @@ program
       const startSim = () => {
         if (started) return;
         started = true;
-        runner.runDays(targetDays).catch((err) => console.error("[Live Sim Error]", err));
+        runner
+          .runDays(targetDays)
+          .then((outcome) => {
+            serverHandle?.broadcastState(
+              runId,
+              runner.state.day,
+              runner.state.phase,
+              outcome.budgetStopped ? "budget_stopped" : "completed",
+              runner.state,
+              store.readAllStats(),
+              rateLimiter.getHealth()
+            );
+          })
+          .catch((err) => console.error("[Live Sim Error]", err));
       };
 
       serverHandle = createApp({
@@ -291,13 +304,7 @@ program
           start: startSim,
           pause: () => runner.pause(),
           resume: () => runner.resume(),
-          step: async () => {
-            // Step one phase if paused
-            const phases: PhaseName[] = ["rollover", "morning", "local_chat", "evening", "end_of_day"];
-            const nextIdx = (phases.indexOf(runner.state.phase) + 1) % phases.length;
-            if (nextIdx === 0) runner.state.day += 1;
-            await runner.runSinglePhase(phases[nextIdx]!);
-          },
+          step: () => runner.stepOnePhase(),
           getHealth: () => rateLimiter.getHealth(),
         },
       });

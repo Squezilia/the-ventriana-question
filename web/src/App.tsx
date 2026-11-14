@@ -82,6 +82,7 @@ export const App: React.FC = () => {
     let cancelled = false;
     let es: EventSource | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let hasOpenedOnce = false;
 
     const loadInitial = async () => {
       try {
@@ -107,7 +108,13 @@ export const App: React.FC = () => {
     const connectStream = () => {
       if (cancelled) return;
       es = new EventSource("/api/stream");
-      es.onopen = () => setConnected(true);
+      es.onopen = () => {
+        setConnected(true);
+        if (hasOpenedOnce) {
+          loadInitial();
+        }
+        hasOpenedOnce = true;
+      };
       es.onmessage = (msgEvent) => {
         try {
           const msg = JSON.parse(msgEvent.data) as StreamStateMessage;

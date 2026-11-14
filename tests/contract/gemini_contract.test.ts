@@ -145,6 +145,8 @@ describe("Layer 4 — LLM Contract Tests against fake server", () => {
         schema: LocalChatOutputSchema,
       });
       expect(r4.success).toBe(false);
+      expect(r4.safetyBlocked).toBe(true);
+      expect(attempts).toBe(2);
     } finally {
       server.stop(true);
     }

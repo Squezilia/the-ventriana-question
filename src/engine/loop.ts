@@ -82,6 +82,9 @@ export class SimulationRunner {
   private dayBirths = 0;
   private paused = false;
   private pauseResolvers: Array<() => void> = [];
+  private stepBudget = 0;
+  private stepDoneResolvers: Array<() => void> = [];
+  private isRunningLoop = false;
 
   constructor(opts: SimulationRunnerOptions) {
     this.state = opts.state;
@@ -101,6 +104,7 @@ export class SimulationRunner {
 
   resume(): void {
     this.paused = false;
+    this.stepBudget = 0;
     const resolvers = this.pauseResolvers.splice(0);
     for (const r of resolvers) r();
   }
@@ -109,11 +113,34 @@ export class SimulationRunner {
     return this.paused;
   }
 
+  async stepOnePhase(): Promise<void> {
+    if (!this.isRunningLoop) return;
+    this.paused = true;
+    const donePromise = new Promise<void>((resolve) => {
+      this.stepDoneResolvers.push(resolve);
+    });
+    if (this.pauseResolvers.length > 0) {
+      this.stepBudget += 1;
+      const resolvers = this.pauseResolvers.splice(0);
+      for (const r of resolvers) r();
+    } else {
+      // A phase is currently in-flight; wait for it to finish
+    }
+    await donePromise;
+  }
+
   private async waitIfPaused(): Promise<void> {
     if (!this.paused) return;
+    if (this.stepBudget > 0) {
+      this.stepBudget -= 1;
+      return;
+    }
     await new Promise<void>((resolve) => {
       this.pauseResolvers.push(resolve);
     });
+    if (this.paused && this.stepBudget > 0) {
+      this.stepBudget -= 1;
+    }
   }
 
   private async emit(event: Omit<SimEvent, "id" | "timestamp">): Promise<void> {
@@ -149,39 +176,48 @@ export class SimulationRunner {
       }
     }
 
-    for (let day = startDay; day < targetEndDayExclusive; day++) {
-      this.state.day = day;
-      if (day > startDay) {
-        this.rateLimiter?.resetDailyCounter();
-      }
-      const firstIdx = day === startDay ? startPhaseIdx : 0;
+    this.isRunningLoop = true;
+    try {
+      for (let day = startDay; day < targetEndDayExclusive; day++) {
+        this.state.day = day;
+        if (day > startDay) {
+          this.rateLimiter?.resetDailyCounter();
+        }
+        const firstIdx = day === startDay ? startPhaseIdx : 0;
 
-      for (let pIdx = firstIdx; pIdx < PHASE_ORDER.length; pIdx++) {
-        await this.waitIfPaused();
-        const phase = PHASE_ORDER[pIdx]!;
-        await this.runSinglePhase(phase);
+        for (let pIdx = firstIdx; pIdx < PHASE_ORDER.length; pIdx++) {
+          await this.waitIfPaused();
+          const phase = PHASE_ORDER[pIdx]!;
+          await this.runSinglePhase(phase);
+          const stepResolvers = this.stepDoneResolvers.splice(0);
+          for (const r of stepResolvers) r();
 
-        if (this.rateLimiter) {
-          const budget = this.rateLimiter.isBudgetExhausted();
-          if (budget.exhausted) {
-            await this.storage.updateRunMetadata({
-              status: "budget_stopped",
-              lastCompletedDay: day,
-              lastCompletedPhase: phase,
-            });
-            return { completed: false, budgetStopped: true, reason: budget.reason };
+          if (this.rateLimiter) {
+            const budget = this.rateLimiter.isBudgetExhausted();
+            if (budget.exhausted) {
+              await this.storage.updateRunMetadata({
+                status: "budget_stopped",
+                lastCompletedDay: day,
+                lastCompletedPhase: phase,
+              });
+              return { completed: false, budgetStopped: true, reason: budget.reason };
+            }
           }
         }
       }
-    }
 
-    await this.storage.updateRunMetadata({
-      status: "completed",
-      endedAt: new Date().toISOString(),
-      lastCompletedDay: targetEndDayExclusive - 1,
-      lastCompletedPhase: "end_of_day",
-    });
-    return { completed: true, budgetStopped: false };
+      await this.storage.updateRunMetadata({
+        status: "completed",
+        endedAt: new Date().toISOString(),
+        lastCompletedDay: targetEndDayExclusive - 1,
+        lastCompletedPhase: "end_of_day",
+      });
+      return { completed: true, budgetStopped: false };
+    } finally {
+      this.isRunningLoop = false;
+      const stepResolvers = this.stepDoneResolvers.splice(0);
+      for (const r of stepResolvers) r();
+    }
   }
 
   async runSinglePhase(phase: PhaseName): Promise<void> {
@@ -815,16 +851,29 @@ export class SimulationRunner {
     const prng = new SeededPRNG(this.state.prngState);
     const regionIds = Object.keys(this.state.regions).sort();
 
-    await Promise.all(
-      regionIds.map(async (regionId) => {
-        const reg = this.state.regions[regionId]!;
-        const country = this.state.countries[reg.countryId]!;
-        const occupants = Object.values(this.state.agents).filter(
+    // Pre-compute deterministic speaker orders for all regions and rounds before async calls
+    const regionPlans = regionIds.map((regionId) => {
+      const occupants = Object.values(this.state.agents)
+        .filter(
           (a) =>
             a.alive &&
             a.region === regionId &&
             (this.config.INFANTS_SPEAK_IN_LOCAL_CHAT || a.age >= this.config.EDUCATION_DAYS)
-        );
+        )
+        .sort((a, b) => a.numericId - b.numericId);
+
+      const roundOrders: Agent[][] = [];
+      for (let round = 1; round <= this.config.ROUNDS_PER_DAY; round++) {
+        roundOrders.push(occupants.length > 1 ? prng.shuffle(occupants) : []);
+      }
+      return { regionId, occupants, roundOrders };
+    });
+    this.state.prngState = prng.getState();
+
+    await Promise.all(
+      regionPlans.map(async ({ regionId, occupants, roundOrders }) => {
+        const reg = this.state.regions[regionId]!;
+        const country = this.state.countries[reg.countryId]!;
 
         // Skip local chat LLM calls when a region has <= 1 occupant (Decision #11)
         if (occupants.length <= 1) return;
@@ -835,7 +884,7 @@ export class SimulationRunner {
           .join("\n");
 
         for (let round = 1; round <= this.config.ROUNDS_PER_DAY; round++) {
-          const order = prng.shuffle(occupants);
+          const order = roundOrders[round - 1]!;
           for (const agent of order) {
             const transcript = this.state.localChat
               .filter((c) => c.day === this.state.day && c.regionId === regionId)
@@ -936,8 +985,6 @@ export class SimulationRunner {
         }
       })
     );
-
-    this.state.prngState = prng.getState();
   }
 
   private async runEveningPhase(): Promise<void> {

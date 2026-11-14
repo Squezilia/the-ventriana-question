@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { execSync } from "node:child_process";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -89,5 +89,62 @@ test.describe("Layer 6 — UI & Static Replay E2E", () => {
     await expect(page.getByRole("button", { name: /Spy:/ })).toHaveCount(0);
     await page.getByRole("button", { name: "Social Feed" }).click();
     await expect(page.getByRole("button", { name: /Spy: DMs/ })).toHaveCount(0);
+  });
+
+  test("live mode streams SSE, supports pause/step/resume controls, and recovers on reconnect", async ({
+    page,
+    context,
+  }) => {
+    const liveRunId = "e2e_live_run";
+    const liveRunDir = path.resolve("./runs", liveRunId);
+    fs.rmSync(liveRunDir, { recursive: true, force: true });
+
+    const port = 8799;
+    const proc: ChildProcess = spawn(
+      "bun",
+      ["run", "src/cli/index.ts", "serve", "--live", "--days", "3", "--run", liveRunId],
+      {
+        env: { ...process.env, MOCK_LLM: "true", UI_PORT: String(port) },
+        stdio: "ignore",
+      }
+    );
+
+    try {
+      // Wait for server health
+      let ready = false;
+      for (let i = 0; i < 30; i++) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+          if (res.ok) {
+            ready = true;
+            break;
+          }
+        } catch {
+          // retry
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(ready).toBe(true);
+
+      await page.goto(`http://127.0.0.1:${port}`);
+      await expect(page.getByText("LIVE", { exact: true })).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText("Run Health (Live)")).toBeVisible();
+
+      // Exercise Pause -> Step phase -> Resume
+      await page.getByRole("button", { name: "Pause" }).click();
+      await page.getByRole("button", { name: "Step phase" }).click();
+      await page.getByRole("button", { name: "Resume" }).click();
+
+      // Simulate temporary network drop for SSE reconnect
+      await context.setOffline(true);
+      await new Promise((r) => setTimeout(r, 400));
+      await context.setOffline(false);
+
+      // Should remain connected / reconnect cleanly and render LIVE
+      await expect(page.getByText("LIVE", { exact: true })).toBeVisible({ timeout: 10_000 });
+    } finally {
+      proc.kill("SIGTERM");
+      fs.rmSync(liveRunDir, { recursive: true, force: true });
+    }
   });
 });
