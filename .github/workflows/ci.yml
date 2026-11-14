@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build Web UI
+        run: bun run build:web
+
+      - name: Run Unit, Scenario, Property, Contract & Determinism Tests
+        env:
+          MOCK_LLM: "true"
+        run: bun run test
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install chromium
+
+      - name: Run Playwright UI E2E Tests
+        env:
+          MOCK_LLM: "true"
+        run: bunx playwright test

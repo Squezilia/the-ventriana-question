@@ -1,0 +1,31 @@
+scenarios:
+  - name: independence_succeeds
+    days: 1
+    description: Three Ventrians gather in Teshar and declare independence, creating Ventriana.
+  - name: independence_fails_border_or_share
+    days: 1
+    description: Border closure or insufficient share blocks Ventrian independence.
+  - name: curriculum_rewrite_and_archive_immutable
+    days: 2
+    description: President rewrites curriculum; graduating infant sees new curriculum while ARCHIVE is unchanged.
+  - name: censorship_mutes_agent
+    days: 2
+    description: President mutes an agent; their post is censored and never reaches next day's feed.
+  - name: disenfranchisement_applies_next_election
+    days: 8
+    description: President strips a nation's voting rights on day 1; takes effect on day 7 election.
+  - name: election_region_tie_total_vote_tiebreak
+    days: 1
+    description: Region win tie goes to candidate with more total votes.
+  - name: president_death_runner_up_succession
+    days: 2
+    description: President dies at rollover; election runner-up takes over.
+  - name: will_written_and_inherited
+    days: 2
+    description: Dying agent writes will on age 27; newborn inherits will on rollover.
+  - name: move_cooldown_and_start_of_day_vote
+    days: 2
+    description: Move rejected during cooldown; moved agent votes in start-of-day region.
+  - name: party_lifecycle
+    days: 2
+    description: Party founded, joined, endorses candidate, and dissolves when members leave.

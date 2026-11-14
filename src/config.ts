@@ -129,11 +129,9 @@ export function validateConfigInvariants(config: SimConfig): string[] {
       `Candidate eligibility window is empty: CANDIDACY_MIN_AGE (${config.CANDIDACY_MIN_AGE}) > LIFESPAN_DAYS - 1 - TERM_DAYS (${maxCandidateAge}).`
     );
   }
-  if (config.EDUCATION_DAYS >= config.CANDIDACY_MIN_AGE) {
-    // Normal: education < candidacy
-  } else {
+  if (config.CANDIDACY_MIN_AGE < config.EDUCATION_DAYS) {
     warnings.push(
-      `CANDIDACY_MIN_AGE (${config.CANDIDACY_MIN_AGE}) is <= EDUCATION_DAYS (${config.EDUCATION_DAYS}).`
+      `CANDIDACY_MIN_AGE (${config.CANDIDACY_MIN_AGE}) is < EDUCATION_DAYS (${config.EDUCATION_DAYS}).`
     );
   }
   return warnings;
