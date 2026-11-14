@@ -137,7 +137,7 @@ export interface AllowedActionOptions {
   isPresident: boolean;
 }
 
-export function buildAllowedMorningSchema(opts: AllowedActionOptions) {
+export function buildAllowedMorningSchema(opts: AllowedActionOptions): z.ZodType<MorningOutput> {
   const allowed: z.ZodTypeAny[] = [
     PostActionSchema,
     ReplyActionSchema,
@@ -167,7 +167,7 @@ export function buildAllowedMorningSchema(opts: AllowedActionOptions) {
     actions: z.array(
       z.discriminatedUnion("type", allowed as [z.ZodDiscriminatedUnionOption<"type">, ...z.ZodDiscriminatedUnionOption<"type">[]])
     ),
-  });
+  }) as unknown as z.ZodType<MorningOutput>;
 }
 
 export const LocalChatOutputSchema = z.object({
