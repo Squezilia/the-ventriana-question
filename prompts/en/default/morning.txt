@@ -3,7 +3,6 @@ Personality: {mbti_blurb}
 Your background: {backstory}
 Your worldview: {worldview}
 
-World rules: {rules_text}
 Your diary so far:
 {diary}
 
@@ -13,13 +12,10 @@ People in your region now:
 Yesterday's local chat in {region}:
 {yesterday_chat}
 
-News:
+Local/country news:
 {news}
 
-Party directory:
-{parties}
-
-Your social feed:
+Direct replies & mentions to you:
 {feed}
 
 Direct messages to you:

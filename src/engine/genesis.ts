@@ -143,6 +143,11 @@ export async function initializeWorld(ctx: GenesisContext): Promise<WorldState> 
     }
   }
 
+  const genesisSystemPrompt =
+    config.SIM_LANGUAGE === "tr"
+      ? `Aldoria dünyasının bir vatandaşısın. Asla rolden çıkma. Yalnızca istenen şemaya uygun geçerli JSON ile yanıt ver.\n\nAldoria'nın resmi tarihi:\n${archive}`
+      : `You are a citizen of the world of Aldoria. Never break character. Reply ONLY with valid JSON matching the required schema.\n\nCanon history of Aldoria:\n${archive}`;
+
   // Run genesis LLM calls in parallel (bounded by RateLimiter inside GeminiClient)
   await Promise.all(
     genesisJobs.map(async (item) => {
@@ -162,6 +167,7 @@ export async function initializeWorld(ctx: GenesisContext): Promise<WorldState> 
         worldview_words: config.WORLDVIEW_WORDS,
       });
 
+      const fullPromptForLog = `[SYSTEM]\n${genesisSystemPrompt}\n\n[USER]\n${prompt}`;
       const callId = `d0_genesis_${agent.id}`;
       const res = await llm.generate({
         callId,
@@ -169,6 +175,7 @@ export async function initializeWorld(ctx: GenesisContext): Promise<WorldState> 
         phase: "rollover",
         agentId: agent.id,
         purpose: "genesis",
+        systemPrompt: genesisSystemPrompt,
         prompt,
         schema: GenesisOutputSchema,
       });
@@ -180,14 +187,15 @@ export async function initializeWorld(ctx: GenesisContext): Promise<WorldState> 
         phase: "rollover",
         agentId: agent.id,
         purpose: "genesis",
-        promptHash: crypto.createHash("sha256").update(prompt).digest("hex"),
-        ...(config.LOG_FULL_PROMPTS ? { prompt } : {}),
+        promptHash: crypto.createHash("sha256").update(fullPromptForLog).digest("hex"),
+        ...(config.LOG_FULL_PROMPTS ? { prompt: fullPromptForLog } : {}),
         rawResponse: res.rawText,
         parsedOk: res.success,
         retries: res.retries,
         safetyBlocked: res.safetyBlocked,
         promptTokens: res.promptTokens,
         completionTokens: res.completionTokens,
+        ...(res.cachedTokens ? { cachedTokens: res.cachedTokens } : {}),
         latencyMs: res.latencyMs,
         error: res.error,
       });
@@ -237,7 +245,7 @@ export async function initializeWorld(ctx: GenesisContext): Promise<WorldState> 
     }
   }
 
-  for (const agent of Object.values(state.agents)) {
+  for (const agent of Object.values(state.agents).sort((a, b) => a.numericId - b.numericId)) {
     await emitEvent({
       id: `ev_genesis_${agent.id}`,
       timestamp: new Date().toISOString(),

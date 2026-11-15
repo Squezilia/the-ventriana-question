@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { LocalChatOutputSchema } from "../../contracts/schemas.ts";
 import { GeminiClient } from "../../src/llm/gemini_client.ts";
 import { RateLimiter } from "../../src/llm/rate_limiter.ts";
+import { ReplayLLMClient } from "../../src/llm/replay_client.ts";
 
 describe("Layer 4 — LLM Contract Tests against fake server", () => {
   test("handles 429 and 5xx with backoff, and degrades malformed/safety responses to logged no-op", async () => {
@@ -151,4 +155,141 @@ describe("Layer 4 — LLM Contract Tests against fake server", () => {
       server.stop(true);
     }
   }, 15_000);
+
+  test("captures cachedContentTokenCount, avoids double-counting 429s, and respects Retry-After header", async () => {
+    let attempts = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        attempts += 1;
+        if (attempts === 1) {
+          return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "1",
+            },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [{ text: JSON.stringify({ private_thought: "cached", say: "selam" }) }],
+                },
+                finishReason: "STOP",
+              },
+            ],
+            usageMetadata: {
+              promptTokenCount: 1200,
+              candidatesTokenCount: 40,
+              cachedContentTokenCount: 960,
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+
+    try {
+      const limiter = new RateLimiter({
+        rpmLimit: 100,
+        tpmLimit: 100_000,
+        maxConcurrency: 2,
+        maxTotalCalls: 20,
+        dailyCallBudget: 20,
+      });
+      const client = new GeminiClient({
+        apiKey: "fake-key",
+        modelId: "gemini-2.5-flash",
+        contextWindow: 1_000_000,
+        rateLimiter: limiter,
+        baseURL: `http://127.0.0.1:${server.port}/v1beta`,
+        timeoutMs: 8000,
+        maxNetworkRetries: 2,
+      });
+
+      const t0 = Date.now();
+      const res = await client.generate({
+        callId: "c-cache-429",
+        day: 1,
+        phase: "local_chat",
+        agentId: "a1",
+        purpose: "local_chat",
+        systemPrompt: "Shared long world rules prefix",
+        prompt: "hi",
+        schema: LocalChatOutputSchema,
+      });
+      const elapsed = Date.now() - t0;
+
+      expect(res.success).toBe(true);
+      expect(attempts).toBe(2);
+      expect(elapsed).toBeGreaterThanOrEqual(900);
+      expect(res.promptTokens).toBe(1200);
+      expect(res.completionTokens).toBe(40);
+      expect(res.cachedTokens).toBe(960);
+
+      const health = limiter.getHealth();
+      // Must not double-count the single HTTP 429 (once per 429 response, not again in recordAttempt)
+      expect(health.rateLimit429Count).toBe(1);
+      expect(health.cachedTokensTotal).toBe(960);
+      expect(health.promptTokensTotal).toBe(1200);
+      expect(health.completionTokensTotal).toBe(40);
+    } finally {
+      server.stop(true);
+    }
+  }, 15_000);
+
+  test("ReplayLLMClient skips corrupt trailing JSONL lines and prefers parsedOk: true on duplicate callId", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ventriana-replay-client-"));
+    const jsonlPath = path.join(tmpDir, "llm_calls.jsonl");
+    try {
+      const validEntry = {
+        callId: "c-dup",
+        day: 0,
+        phase: "local_chat",
+        agentId: "a1",
+        purpose: "local_chat",
+        promptHash: "h1",
+        rawResponse: JSON.stringify({ private_thought: "ok", say: "first good" }),
+        parsedOk: true,
+        safetyBlocked: false,
+        retries: 0,
+        latencyMs: 10,
+        promptTokens: 50,
+        completionTokens: 15,
+        timestamp: "2026-01-01T00:00:00.000Z",
+      };
+      const badOverrideAttempt = {
+        ...validEntry,
+        rawResponse: "{corrupt",
+        parsedOk: false,
+        retries: 1,
+      };
+      const lines = [
+        JSON.stringify(badOverrideAttempt),
+        JSON.stringify(validEntry),
+        // Subsequent failed entry should NOT overwrite an earlier parsedOk: true entry
+        JSON.stringify({ ...badOverrideAttempt, retries: 2 }),
+        '{"callId":"truncated-crash',
+      ];
+      fs.writeFileSync(jsonlPath, lines.join("\n"), "utf8");
+
+      const replay = new ReplayLLMClient(jsonlPath);
+      const result = await replay.generate({
+        callId: "c-dup",
+        day: 0,
+        phase: "local_chat",
+        agentId: "a1",
+        purpose: "local_chat",
+        prompt: "hi",
+        schema: LocalChatOutputSchema,
+      });
+      expect(result.success).toBe(true);
+      expect(result.data?.say).toBe("first good");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

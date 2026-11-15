@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { generateObject } from "ai";
 import type {
@@ -15,6 +16,34 @@ export interface GeminiClientOptions {
   baseURL?: string;
   timeoutMs?: number;
   maxNetworkRetries?: number;
+}
+
+interface HttpAttemptTelemetry {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  cachedContentTokenCount?: number;
+  retryAfterMs?: number;
+  status?: number;
+}
+
+export function estimateTokenCount(text: string): number {
+  if (!text) return 0;
+  const utf8Bytes = Buffer.byteLength(text, "utf8");
+  return Math.ceil(Math.max(text.length / 3.1, utf8Bytes / 3.4));
+}
+
+function parseRetryAfterMs(headerVal: string | null): number | undefined {
+  if (!headerVal) return undefined;
+  const trimmed = headerVal.trim();
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.ceil(seconds * 1000);
+  }
+  const dateMs = Date.parse(trimmed);
+  if (Number.isFinite(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+  return undefined;
 }
 
 function isSafetyBlockError(err: unknown): boolean {
@@ -59,21 +88,60 @@ export class GeminiClient implements LLMClient {
   readonly name = "gemini";
   private readonly opts: GeminiClientOptions;
   private readonly google: ReturnType<typeof createGoogleGenerativeAI>;
+  private readonly attemptStorage = new AsyncLocalStorage<HttpAttemptTelemetry>();
 
   constructor(opts: GeminiClientOptions) {
     this.opts = opts;
     this.google = createGoogleGenerativeAI({
       apiKey: opts.apiKey,
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
+      fetch: (async (input, init) => {
+        const response = await fetch(input, init);
+        const telemetry = this.attemptStorage.getStore();
+        if (telemetry) {
+          telemetry.status = response.status;
+          if (response.status === 429 || response.status === 503) {
+            telemetry.retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+          }
+          const contentType = response.headers.get("content-type") ?? "";
+          if (response.ok && contentType.toLowerCase().includes("application/json")) {
+            try {
+              const body = (await response.clone().json()) as {
+                usageMetadata?: {
+                  promptTokenCount?: number;
+                  candidatesTokenCount?: number;
+                  cachedContentTokenCount?: number;
+                };
+              };
+              const meta = body?.usageMetadata;
+              if (meta) {
+                if (typeof meta.promptTokenCount === "number") {
+                  telemetry.promptTokenCount = meta.promptTokenCount;
+                }
+                if (typeof meta.candidatesTokenCount === "number") {
+                  telemetry.candidatesTokenCount = meta.candidatesTokenCount;
+                }
+                if (typeof meta.cachedContentTokenCount === "number") {
+                  telemetry.cachedContentTokenCount = meta.cachedContentTokenCount;
+                }
+              }
+            } catch {
+              // Ignore non-JSON or unreadable cloned body
+            }
+          }
+        }
+        return response;
+      }) as typeof fetch,
     });
   }
 
   async generate<T>(options: LLMGenerateOptions<T>): Promise<LLMGenerateResult<T>> {
     const startMs = Date.now();
-    const estimatedPromptTokens = Math.ceil(options.prompt.length / 4);
-    if (estimatedPromptTokens > this.opts.contextWindow * 0.7) {
+    const systemTokens = estimateTokenCount(options.systemPrompt ?? "");
+    const initialEstimatedTokens = systemTokens + estimateTokenCount(options.prompt);
+    if (initialEstimatedTokens > this.opts.contextWindow * 0.7) {
       console.warn(
-        `[GeminiClient] Context warning: prompt for ${options.callId} (~${estimatedPromptTokens} tokens) exceeds 70% of context window (${this.opts.contextWindow})`
+        `[GeminiClient] Context warning: prompt for ${options.callId} (~${initialEstimatedTokens} tokens) exceeds 70% of context window (${this.opts.contextWindow})`
       );
     }
 
@@ -83,42 +151,69 @@ export class GeminiClient implements LLMClient {
     let validationRetries = 0;
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
-    let saw429 = false;
+    let totalCachedTokens = 0;
     const maxNetRetries = this.opts.maxNetworkRetries ?? 4;
 
     while (true) {
+      const attemptEstTokens = systemTokens + estimateTokenCount(currentPrompt);
+      const telemetry: HttpAttemptTelemetry = {};
+
       try {
-        const res = await this.opts.rateLimiter.run(estimatedPromptTokens, async () => {
+        const res = await this.opts.rateLimiter.run(attemptEstTokens, async (reservation) => {
           const model = this.google(this.opts.modelId);
           const controller = new AbortController();
           const timeoutMs = this.opts.timeoutMs ?? 60_000;
           const timer = setTimeout(() => controller.abort(), timeoutMs);
           try {
-            return await generateObject({
-              model,
-              schema: options.schema,
-              prompt: currentPrompt,
-              system: options.systemPrompt,
-              maxRetries: 0,
-              abortSignal: controller.signal,
-            });
+            const out = await this.attemptStorage.run(telemetry, () =>
+              generateObject({
+                model,
+                schema: options.schema,
+                prompt: currentPrompt,
+                system: options.systemPrompt,
+                maxRetries: 0,
+                abortSignal: controller.signal,
+              })
+            );
+            const pTok =
+              telemetry.promptTokenCount ?? out.usage?.promptTokens ?? attemptEstTokens;
+            const cTok = telemetry.candidatesTokenCount ?? out.usage?.completionTokens ?? 0;
+            reservation.settle(pTok + cTok);
+            return out;
+          } catch (attemptErr) {
+            // Settle actual tokens if HTTP response returned usage metadata (e.g. schema/JSON error);
+            // otherwise release reserved TPM tokens when the HTTP call failed transiently.
+            if (
+              telemetry.promptTokenCount !== undefined ||
+              telemetry.candidatesTokenCount !== undefined
+            ) {
+              reservation.settle(
+                (telemetry.promptTokenCount ?? 0) + (telemetry.candidatesTokenCount ?? 0)
+              );
+            } else {
+              reservation.settle(0);
+            }
+            throw attemptErr;
           } finally {
             clearTimeout(timer);
           }
         });
 
-        const pTok = res.usage?.promptTokens ?? estimatedPromptTokens;
-        const cTok = res.usage?.completionTokens ?? 0;
+        const pTok = telemetry.promptTokenCount ?? res.usage?.promptTokens ?? attemptEstTokens;
+        const cTok = telemetry.candidatesTokenCount ?? res.usage?.completionTokens ?? 0;
+        const cachedTok = telemetry.cachedContentTokenCount ?? 0;
         totalPromptTokens += pTok;
         totalCompletionTokens += cTok;
+        totalCachedTokens += cachedTok;
 
         this.opts.rateLimiter.recordAttempt({
           promptTokens: totalPromptTokens,
           completionTokens: totalCompletionTokens,
+          cachedTokens: totalCachedTokens,
           retries,
           invalidOutput: false,
           safetyBlocked: false,
-          rateLimit429: saw429,
+          alreadyWindowTracked: true,
         });
 
         return {
@@ -127,11 +222,22 @@ export class GeminiClient implements LLMClient {
           rawText: JSON.stringify(res.object),
           promptTokens: totalPromptTokens,
           completionTokens: totalCompletionTokens,
+          ...(totalCachedTokens > 0 ? { cachedTokens: totalCachedTokens } : {}),
           latencyMs: Date.now() - startMs,
           retries,
           safetyBlocked: false,
         };
       } catch (err) {
+        if (telemetry.promptTokenCount !== undefined) {
+          totalPromptTokens += telemetry.promptTokenCount;
+        }
+        if (telemetry.candidatesTokenCount !== undefined) {
+          totalCompletionTokens += telemetry.candidatesTokenCount;
+        }
+        if (telemetry.cachedContentTokenCount !== undefined) {
+          totalCachedTokens += telemetry.cachedContentTokenCount;
+        }
+
         const errMsg = err instanceof Error ? err.message : String(err);
 
         // 1. Safety block: retry once, then logged no-op
@@ -144,10 +250,11 @@ export class GeminiClient implements LLMClient {
           this.opts.rateLimiter.recordAttempt({
             promptTokens: totalPromptTokens,
             completionTokens: totalCompletionTokens,
+            cachedTokens: totalCachedTokens,
             retries,
             invalidOutput: false,
             safetyBlocked: true,
-            rateLimit429: saw429,
+            alreadyWindowTracked: true,
           });
           return {
             success: false,
@@ -155,6 +262,7 @@ export class GeminiClient implements LLMClient {
             rawText: "",
             promptTokens: totalPromptTokens,
             completionTokens: totalCompletionTokens,
+            ...(totalCachedTokens > 0 ? { cachedTokens: totalCachedTokens } : {}),
             latencyMs: Date.now() - startMs,
             retries,
             safetyBlocked: true,
@@ -162,15 +270,18 @@ export class GeminiClient implements LLMClient {
           };
         }
 
-        // 2. Transient 429 / 5xx / timeout: exponential backoff
+        // 2. Transient 429 / 5xx / timeout: exponential backoff (respecting Retry-After)
         const transient = isTransientHttpError(err);
         if (transient.transient && retries < maxNetRetries) {
-          if (transient.is429) {
-            saw429 = true;
-            this.opts.rateLimiter.record429();
-          }
           retries += 1;
-          const backoffMs = Math.min(1000 * Math.pow(2, retries - 1), 16_000);
+          const expBackoffMs = Math.min(1000 * Math.pow(2, retries - 1), 16_000);
+          const backoffMs =
+            telemetry.retryAfterMs !== undefined
+              ? Math.min(Math.max(telemetry.retryAfterMs, expBackoffMs), 60_000)
+              : expBackoffMs;
+          if (transient.is429 || telemetry.status === 429) {
+            this.opts.rateLimiter.record429(backoffMs);
+          }
           console.warn(
             `[GeminiClient] Transient error on ${options.callId} (attempt ${retries}): ${errMsg}. Backing off ${backoffMs}ms`
           );
@@ -189,10 +300,11 @@ export class GeminiClient implements LLMClient {
         this.opts.rateLimiter.recordAttempt({
           promptTokens: totalPromptTokens,
           completionTokens: totalCompletionTokens,
+          cachedTokens: totalCachedTokens,
           retries,
           invalidOutput: true,
           safetyBlocked: false,
-          rateLimit429: saw429,
+          alreadyWindowTracked: true,
         });
 
         return {
@@ -201,6 +313,7 @@ export class GeminiClient implements LLMClient {
           rawText: "",
           promptTokens: totalPromptTokens,
           completionTokens: totalCompletionTokens,
+          ...(totalCachedTokens > 0 ? { cachedTokens: totalCachedTokens } : {}),
           latencyMs: Date.now() - startMs,
           retries,
           safetyBlocked: false,

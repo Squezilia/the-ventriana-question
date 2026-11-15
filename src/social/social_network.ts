@@ -79,7 +79,9 @@ export function createPostOrReply(
   }
 
   if (replyToId) {
-    const parent = state.posts.find((p) => p.id === replyToId && !p.censored);
+    const parent = state.posts.find(
+      (p) => p.id === replyToId && !p.censored && p.deliveredDay <= state.day
+    );
     if (!parent) {
       return { accepted: false, censored: false, censoredByCountry: null, truncated: false, reason: `Parent post ${replyToId} not found` };
     }
@@ -197,6 +199,71 @@ export function addLike(
   return { accepted: false, reason: `Target ${targetId} not found` };
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function buildAgentMentionMatcher(agentName: string): (postText: string) => boolean {
+  const trimmed = agentName.trim();
+  if (!trimmed) return () => false;
+  const lowerName = trimmed.toLowerCase();
+  let re: RegExp | null = null;
+  return (postText: string) => {
+    if (!postText.toLowerCase().includes(lowerName)) return false;
+    if (!re) {
+      re = new RegExp(`(?<![\\p{L}\\p{N}_])@?${escapeRegExp(trimmed)}(?![\\p{L}\\p{N}_])`, "iu");
+    }
+    return re.test(postText);
+  };
+}
+
+/**
+ * Shared chronological public social feed window for morning phase (delivered today, uncensored).
+ * Sorted newest-first and capped at FEED_WINDOW_POSTS.
+ */
+export function getSharedMorningFeedWindow(
+  state: WorldState,
+  config: SimConfig,
+  deliveredToday?: Post[]
+): Post[] {
+  const source =
+    deliveredToday ??
+    state.posts.filter((p) => !p.censored && p.deliveredDay === state.day);
+  const out: Post[] = [];
+  for (let i = source.length - 1; i >= 0 && out.length < config.FEED_WINDOW_POSTS; i--) {
+    out.push(source[i]!);
+  }
+  return out;
+}
+
+/**
+ * Direct replies & word-boundary @mentions targeting a specific agent from today's delivered feed.
+ */
+export function getAgentPriorityFeedPosts(
+  state: WorldState,
+  agent: Agent,
+  limit: number = 15,
+  precomputed?: { deliveredToday: Post[]; myPostIds: Set<string> }
+): Post[] {
+  const recent =
+    precomputed?.deliveredToday ??
+    state.posts.filter((p) => !p.censored && p.deliveredDay === state.day);
+  const myPostIds =
+    precomputed?.myPostIds ??
+    new Set(state.posts.filter((p) => p.authorId === agent.id).map((p) => p.id));
+  const matchesMe = buildAgentMentionMatcher(agent.name);
+  const priority: Post[] = [];
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const p = recent[i]!;
+    const isReplyToMe = p.replyToId !== null && myPostIds.has(p.replyToId);
+    if (isReplyToMe || matchesMe(p.text)) {
+      priority.push(p);
+      if (priority.length >= limit) break;
+    }
+  }
+  return priority;
+}
+
 /**
  * Builds an agent's morning social feed:
  * Last FEED_WINDOW_POSTS non-censored posts delivered today (past 24h),
@@ -214,18 +281,14 @@ export function buildAgentFeed(
   const myPostIds = new Set(
     state.posts.filter((p) => p.authorId === agent.id).map((p) => p.id)
   );
-  const mentionToken = `@${agent.name.toLowerCase()}`;
-  const nameLower = agent.name.toLowerCase();
+  const matchesMe = buildAgentMentionMatcher(agent.name);
 
   const priority: Post[] = [];
   const rest: Post[] = [];
 
   for (const p of recent) {
     const isReplyToMe = p.replyToId !== null && myPostIds.has(p.replyToId);
-    const mentionsMe =
-      p.text.toLowerCase().includes(mentionToken) ||
-      p.text.toLowerCase().includes(nameLower);
-    if (isReplyToMe || mentionsMe) {
+    if (isReplyToMe || matchesMe(p.text)) {
       priority.push(p);
     } else {
       rest.push(p);

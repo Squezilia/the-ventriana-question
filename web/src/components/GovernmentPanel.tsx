@@ -7,19 +7,82 @@ interface GovernmentPanelProps {
   onSelectAgent: (agentId: string) => void;
 }
 
-function computeWordDiff(oldText: string, newText: string): Array<{ type: "same" | "add" | "del"; word: string }> {
-  const a = oldText.split(/\s+/).filter(Boolean);
-  const b = newText.split(/\s+/).filter(Boolean);
-  const setA = new Set(a);
-  const setB = new Set(b);
-  const out: Array<{ type: "same" | "add" | "del"; word: string }> = [];
-  for (const w of a) {
-    if (!setB.has(w)) out.push({ type: "del", word: w });
+export function computeWordDiff(
+  oldText: string,
+  newText: string
+): Array<{ type: "same" | "add" | "del"; word: string }> {
+  const a = oldText.trim().split(/\s+/).filter(Boolean);
+  const b = newText.trim().split(/\s+/).filter(Boolean);
+
+  // Trim identical prefix & suffix before building LCS DP table
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) {
+    start += 1;
   }
-  for (const w of b) {
-    out.push({ type: setA.has(w) ? "same" : "add", word: w });
+  let endA = a.length - 1;
+  let endB = b.length - 1;
+  while (endA >= start && endB >= start && a[endA] === b[endB]) {
+    endA -= 1;
+    endB -= 1;
   }
-  return out;
+
+  const midA = a.slice(start, endA + 1);
+  const midB = b.slice(start, endB + 1);
+  const m = midA.length;
+  const n = midB.length;
+
+  const prefix = a.slice(0, start).map((word) => ({ type: "same" as const, word }));
+  const suffix = a.slice(endA + 1).map((word) => ({ type: "same" as const, word }));
+
+  // Guard against extreme curriculum inputs (>600 unique middle words)
+  if (m * n > 250_000) {
+    return [
+      ...prefix,
+      ...midA.map((word) => ({ type: "del" as const, word })),
+      ...midB.map((word) => ({ type: "add" as const, word })),
+      ...suffix,
+    ];
+  }
+
+  const dp: Uint32Array[] = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) {
+    const row = dp[i]!;
+    const nextRow = dp[i + 1]!;
+    for (let j = n - 1; j >= 0; j--) {
+      if (midA[i] === midB[j]) {
+        row[j] = nextRow[j + 1]! + 1;
+      } else {
+        row[j] = Math.max(nextRow[j]!, row[j + 1]!);
+      }
+    }
+  }
+
+  const midOut: Array<{ type: "same" | "add" | "del"; word: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (midA[i] === midB[j]) {
+      midOut.push({ type: "same", word: midA[i]! });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) {
+      midOut.push({ type: "del", word: midA[i]! });
+      i += 1;
+    } else {
+      midOut.push({ type: "add", word: midB[j]! });
+      j += 1;
+    }
+  }
+  while (i < m) {
+    midOut.push({ type: "del", word: midA[i]! });
+    i += 1;
+  }
+  while (j < n) {
+    midOut.push({ type: "add", word: midB[j]! });
+    j += 1;
+  }
+
+  return [...prefix, ...midOut, ...suffix];
 }
 
 export const GovernmentPanel: React.FC<GovernmentPanelProps> = ({

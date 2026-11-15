@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Agent, SimConfig, WorldState } from "../../contracts/types.ts";
-import { loadConfig } from "../../src/config.ts";
+import { buildStaticReplayHtml } from "../../src/cli/replay_build.ts";
+import { loadConfig, sanitizeConfig } from "../../src/config.ts";
 import { initializeWorld } from "../../src/engine/genesis.ts";
 import {
   freezeCandidatesForCountry,
@@ -13,6 +17,7 @@ import { resolveIndependenceDeclarations } from "../../src/governance/independen
 import { executePresidentAction } from "../../src/governance/president.ts";
 import { MockLLMClient } from "../../src/llm/mock_client.ts";
 import { PromptLoader } from "../../src/llm/prompt_loader.ts";
+import { RateLimiter } from "../../src/llm/rate_limiter.ts";
 import {
   endorseCandidate,
   foundParty,
@@ -22,8 +27,11 @@ import {
 import {
   addLike,
   createPostOrReply,
+  getAgentPriorityFeedPosts,
   sendDirectMessage,
 } from "../../src/social/social_network.ts";
+import { RunStore } from "../../src/storage/run_store.ts";
+import { computeWordDiff } from "../../web/src/components/GovernmentPanel.tsx";
 
 async function makeTestWorld(seed = 42): Promise<{
   state: WorldState;
@@ -269,5 +277,344 @@ describe("Unit Tests — President Powers, Budgets, Censorship & Independence", 
     const rem2 = removeAgentFromParty(state, a2);
     expect(rem2.dissolvedPartyId).toBe(party.id);
     expect(party.dissolved).toBe(true);
+  });
+});
+
+describe("Unit Tests — RateLimiter, Caching Telemetry, Governance & Redaction", () => {
+  test("RateLimiter handles oversized empty-window request without deadlock and honors 429 cooldown + seedTotals", async () => {
+    const oversizedLimiter = new RateLimiter({
+      rpmLimit: 20,
+      tpmLimit: 100,
+      maxConcurrency: 4,
+      maxTotalCalls: 5,
+      dailyCallBudget: 4,
+    });
+
+    // Oversized estimatedTokens > tpmLimit on an empty window completes without hanging.
+    const t0 = Date.now();
+    const res = await oversizedLimiter.run(250, async () => "ok");
+    expect(res).toBe("ok");
+    expect(Date.now() - t0).toBeLessThan(200);
+
+    const limiter = new RateLimiter({
+      rpmLimit: 20,
+      tpmLimit: 1000,
+      maxConcurrency: 4,
+      maxTotalCalls: 5,
+      dailyCallBudget: 4,
+    });
+
+    // 429 cooldown delays subsequent run and increments throttledCount once.
+    limiter.record429(60);
+    const t1 = Date.now();
+    await limiter.run(10, async () => "after-429");
+    expect(Date.now() - t1).toBeGreaterThanOrEqual(40);
+    expect(limiter.getHealth().throttledCount).toBe(1);
+    expect(limiter.getHealth().rateLimit429Count).toBe(1);
+
+    // seedTotals restores prior usage and tracks cached tokens + daily/total exhaustion.
+    limiter.seedTotals({
+      totalCalls: 3,
+      dailyCalls: 2,
+      promptTokensTotal: 100,
+      completionTokensTotal: 50,
+      cachedTokensTotal: 40,
+    });
+    limiter.recordAttempt({
+      promptTokens: 20,
+      completionTokens: 10,
+      cachedTokens: 15,
+      retries: 0,
+      invalidOutput: false,
+      safetyBlocked: false,
+    });
+    const health = limiter.getHealth();
+    expect(health.totalCalls).toBe(4);
+    expect(health.cachedTokensTotal).toBe(55);
+    expect(limiter.isBudgetExhausted().exhausted).toBe(false);
+
+    // 4th daily call hits dailyCallBudget: 4 -> exhausted
+    limiter.recordAttempt({
+      promptTokens: 5,
+      completionTokens: 5,
+      retries: 0,
+      invalidOutput: false,
+      safetyBlocked: false,
+    });
+    const budget = limiter.isBudgetExhausted();
+    expect(budget.exhausted).toBe(true);
+    expect(budget.reason).toBeDefined();
+  });
+
+  test("sanitizeConfig, RunStore, and buildStaticReplayHtml never leak GEMINI_API_KEY and deduplicate stats", async () => {
+    const { config } = loadConfig();
+    const secretConfig: SimConfig = { ...config, GEMINI_API_KEY: "AIza-secret-value" };
+    const sanitized = sanitizeConfig(secretConfig);
+    expect(sanitized.GEMINI_API_KEY).toBeUndefined();
+    expect("GEMINI_API_KEY" in sanitized).toBe(false);
+    // Input object should not be mutated.
+    expect(secretConfig.GEMINI_API_KEY).toBe("AIza-secret-value");
+
+    const { state } = await makeTestWorld(3);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ventriana-unit-"));
+    const store = new RunStore(tmpDir);
+    try {
+      await store.initRun({
+        runId: "unit-run",
+        seed: 3,
+        modelId: "mock",
+        mockLlm: true,
+        language: "en",
+        promptVariant: "default",
+        gitCommit: "test",
+        specHash: "test",
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        config: secretConfig,
+        status: "running",
+        lastCompletedDay: -1,
+        lastCompletedPhase: null,
+      });
+
+      const runJsonText = fs.readFileSync(path.join(tmpDir, "run.json"), "utf8");
+      expect(runJsonText).not.toContain("AIza-secret-value");
+      expect((await store.getRunMetadata())?.config.GEMINI_API_KEY).toBeUndefined();
+
+      // Simulate legacy dirty run.json on disk: getRunMetadata() still strips GEMINI_API_KEY.
+      const metaOnDisk = JSON.parse(runJsonText);
+      metaOnDisk.config.GEMINI_API_KEY = "legacy-secret-key";
+      fs.writeFileSync(path.join(tmpDir, "run.json"), JSON.stringify(metaOnDisk));
+      expect((await store.getRunMetadata())?.config.GEMINI_API_KEY).toBeUndefined();
+
+      await store.saveSnapshot(0, "end_of_day", state);
+      expect(store.getAvailableCheckpointDays()).toEqual([0]);
+
+      // Stats CSV deduplication by day.
+      const baseStat = {
+        day: 0,
+        totalAlive: 27,
+        ventrianRegionsCount: 2,
+        largestVentrianCluster: 2,
+        lyriaRegionsCount: 4,
+        skaliaRegionsCount: 3,
+        ventrianaRegionsCount: 2,
+        lyriaPresident: "a1",
+        lyriaPresidentNation: "lyrians",
+        skaliaPresident: "a2",
+        skaliaPresidentNation: "skalians",
+        ventrianaPresident: "a3",
+        ventrianaPresidentNation: "ventrians",
+        activeParties: 0,
+        postsCount: 2,
+        dmsCount: 1,
+        localChatCount: 4,
+        worksCount: 0,
+        deathsCount: 0,
+        birthsCount: 0,
+        regionNationCounts: Object.fromEntries(
+          Object.keys(state.regions).map((rid) => [
+            rid,
+            { lyrians: 1, skalians: 1, ventrians: 1 },
+          ]),
+        ) as Record<keyof typeof state.regions, { lyrians: number; skalians: number; ventrians: number }>,
+      };
+      await store.appendDailyStats(baseStat);
+      await store.appendDailyStats({ ...baseStat, postsCount: 99 });
+      await store.appendDailyStats({ ...baseStat, day: 1, postsCount: 5 });
+      const readBackStats = store.readAllStats();
+      expect(readBackStats.length).toBe(2);
+      expect(readBackStats[0]?.postsCount).toBe(99);
+      expect(readBackStats[1]?.day).toBe(1);
+      const csvLines = fs
+        .readFileSync(path.join(tmpDir, "stats.csv"), "utf8")
+        .trim()
+        .split("\n");
+      expect(csvLines.length).toBe(3); // header + day 0 + day 1
+
+      // Usage summary sums cachedTokens and counts calls on today's local calendar day.
+      const todayIso = new Date().toISOString();
+      await store.appendLLMCall({
+        callId: "c-old",
+        day: 0,
+        phase: "morning",
+        agentId: "a1",
+        purpose: "morning_action",
+        promptHash: "h1",
+        rawResponse: "{}",
+        parsedOk: true,
+        safetyBlocked: false,
+        retries: 0,
+        latencyMs: 10,
+        promptTokens: 50,
+        completionTokens: 10,
+        cachedTokens: 30,
+        timestamp: "2020-01-01T00:00:00.000Z",
+      });
+      await store.appendLLMCall({
+        callId: "c-today",
+        day: 1,
+        phase: "morning",
+        agentId: "a2",
+        purpose: "morning_action",
+        promptHash: "h2",
+        rawResponse: "{bad",
+        parsedOk: false,
+        safetyBlocked: false,
+        retries: 1,
+        latencyMs: 12,
+        promptTokens: 70,
+        completionTokens: 20,
+        cachedTokens: 45,
+        timestamp: todayIso,
+      });
+      const usage = store.getLLMUsageSummary();
+      expect(usage.totalCalls).toBe(2);
+      expect(usage.dailyCalls).toBe(1);
+      expect(usage.cachedTokensTotal).toBe(75);
+      expect(usage.retryCount).toBe(1);
+      expect(usage.invalidOutputCount).toBe(1);
+
+      // Build static HTML and verify secret redaction even when run.json had a key.
+      const fakeDistHtml = path.join(tmpDir, "dist-index.html");
+      fs.writeFileSync(
+        fakeDistHtml,
+        `<!doctype html><html><head></head><body><div id="root"></div><script type="module"></script></body></html>`,
+      );
+      const builtPath = await buildStaticReplayHtml({
+        runDir: tmpDir,
+        noPrivate: true,
+        webDistIndexHtml: fakeDistHtml,
+      });
+      const html = fs.readFileSync(builtPath, "utf8");
+      expect(html).not.toContain("legacy-secret-key");
+      expect(html).toContain('"snapshots":{"0":{');
+      expect(html).toContain('"noPrivate":true');
+    } finally {
+      store.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("executePresidentAction resolves region IDs case-insensitively without duplicates and matches work_id trims", async () => {
+    const { state, config } = await makeTestWorld(11);
+    const lyria = state.countries.lyria;
+    const lyriaPresident = Object.values(state.agents).find(
+      (a) => state.regions[a.region]!.countryId === "lyria" && a.age >= config.EDUCATION_DAYS,
+    )!;
+    lyria.presidentId = lyriaPresident.id;
+    lyria.decisionsLeft = 4;
+
+    const targetRegionId = lyria.regions[0]!;
+    const targetRegionName = state.regions[targetRegionId]!.name;
+    const r1 = executePresidentAction(
+      state,
+      lyriaPresident,
+      { type: "set_border", region: targetRegionName.toUpperCase(), blocked: "all" },
+      config,
+    );
+    expect(r1.succeeded).toBe(true);
+    expect(lyria.laws.borders[targetRegionId]).toBe("all");
+
+    const r2 = executePresidentAction(
+      state,
+      lyriaPresident,
+      { type: "set_border", region: targetRegionId.toUpperCase(), blocked: ["ventrians"] },
+      config,
+    );
+    expect(r2.succeeded).toBe(true);
+    expect(lyria.laws.borders[targetRegionId]).toEqual(["ventrians"]);
+
+    // cede_region resolves by display name and doesn't duplicate regions in target country
+    const cedeId = lyria.regions[lyria.regions.length - 1]!;
+    const cedeName = state.regions[cedeId]!.name;
+    const r3 = executePresidentAction(
+      state,
+      lyriaPresident,
+      { type: "cede_region", region: ` ${cedeName.toUpperCase()} `, to_nation: "ventrians" },
+      config,
+    );
+    expect(r3.succeeded).toBe(true);
+    expect(state.regions[cedeId]!.countryId).toBe("ventriana");
+    expect(new Set(state.countries.ventriana.regions).size).toBe(
+      state.countries.ventriana.regions.length,
+    );
+
+    state.works.push({
+      id: "W_Anthem_1",
+      day: 1,
+      authorId: lyriaPresident.id,
+      authorName: lyriaPresident.name,
+      authorNation: lyriaPresident.nation,
+      kind: "poem",
+      text: "Song of Lyria — rise with the dawn",
+      likes: [],
+    });
+    const adopted = executePresidentAction(
+      state,
+      lyriaPresident,
+      { type: "adopt_anthem", work_id: "  w_anthem_1 \n" },
+      config,
+    );
+    expect(adopted.succeeded).toBe(true);
+    expect(lyria.anthemWorkId).toBe("W_Anthem_1");
+  });
+
+  test("getAgentPriorityFeedPosts enforces deliveredDay and word-boundary mentions; computeWordDiff keeps context intact", async () => {
+    const { state, config } = await makeTestWorld(7);
+    const adults = Object.values(state.agents).filter(
+      (a) => a.alive && a.age >= config.EDUCATION_DAYS,
+    );
+    const ali = adults[0]!;
+    ali.name = "Ali";
+    const other = adults[1]!;
+    other.name = "Alina";
+
+    state.day = 3;
+    const pFalseRes = createPostOrReply(
+      state,
+      other,
+      "Alice and Alina walked in the square today",
+      null,
+      config,
+    );
+    pFalseRes.post!.deliveredDay = 3;
+    const pTrueRes = createPostOrReply(
+      state,
+      other,
+      "Hey @Ali, check the northern square!",
+      null,
+      config,
+    );
+    pTrueRes.post!.deliveredDay = 3;
+    const pFutureRes = createPostOrReply(
+      state,
+      other,
+      "Ali tomorrow this delivers",
+      null,
+      config,
+    );
+    pFutureRes.post!.deliveredDay = 4;
+
+    const priorityIds = new Set(
+      getAgentPriorityFeedPosts(state, ali, 10).map((p) => p.id),
+    );
+    expect(priorityIds.has(pTrueRes.post!.id)).toBe(true);
+    expect(priorityIds.has(pFalseRes.post!.id)).toBe(false);
+    expect(priorityIds.has(pFutureRes.post!.id)).toBe(false);
+
+    const diff = computeWordDiff(
+      "Reason unity dignity justice",
+      "Reason courage unity dignity freedom justice",
+    );
+    expect(diff.filter((d) => d.type === "same").map((d) => d.word)).toEqual([
+      "Reason",
+      "unity",
+      "dignity",
+      "justice",
+    ]);
+    expect(diff.filter((d) => d.type === "add").map((d) => d.word)).toEqual([
+      "courage",
+      "freedom",
+    ]);
   });
 });

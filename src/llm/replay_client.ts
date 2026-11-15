@@ -18,8 +18,17 @@ export class ReplayLLMClient implements LLMClient {
     for (const line of content.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      const entry = JSON.parse(trimmed) as LLMCallLogEntry;
-      this.byCallId.set(entry.callId, entry);
+      let entry: LLMCallLogEntry;
+      try {
+        entry = JSON.parse(trimmed) as LLMCallLogEntry;
+      } catch {
+        console.warn(`[ReplayLLMClient] Skipping corrupt JSONL line in ${jsonlPath}`);
+        continue;
+      }
+      const existing = this.byCallId.get(entry.callId);
+      if (!existing || entry.parsedOk || !existing.parsedOk) {
+        this.byCallId.set(entry.callId, entry);
+      }
     }
   }
 

@@ -75,11 +75,13 @@ export const EventLogPanel: React.FC<EventLogPanelProps> = ({
             className="rounded border border-slate-700 bg-[#0b0e14] px-2 py-1 text-slate-200"
           >
             <option value="all">All citizens</option>
-            {Object.values(state.agents).map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name} ({a.id})
-              </option>
-            ))}
+            {Object.values(state.agents)
+              .sort((a, b) => a.numericId - b.numericId)
+              .map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name} ({a.id})
+                </option>
+              ))}
           </select>
           <input
             type="text"

@@ -13,6 +13,7 @@ import type {
   Nation,
   PhaseName,
   RegionId,
+  RunMetadata,
   SimConfig,
   WorldConfig,
   WorldState,
@@ -27,7 +28,7 @@ import { canQueueIndependence, resolveIndependenceDeclarations } from "../govern
 import { executePresidentAction, isPresidentAction } from "../governance/president.ts";
 import type { PromptLoader } from "../llm/prompt_loader.ts";
 import type { RateLimiter } from "../llm/rate_limiter.ts";
-import { publishWork } from "../social/culture.ts";
+import { getHallOfFame, publishWork } from "../social/culture.ts";
 import {
   endorseCandidate,
   foundParty,
@@ -37,9 +38,10 @@ import {
 } from "../social/parties.ts";
 import {
   addLike,
-  buildAgentFeed,
   createPostOrReply,
   getAgentDeliveredDms,
+  getAgentPriorityFeedPosts,
+  getSharedMorningFeedWindow,
   sendDirectMessage,
 } from "../social/social_network.ts";
 import { runRolloverPhase } from "./lifecycle.ts";
@@ -56,6 +58,11 @@ export interface SimulationRunnerOptions {
   rateLimiter?: RateLimiter;
   onEvent?: (event: SimEvent) => void;
   onPhaseComplete?: (day: number, phase: PhaseName, state: WorldState) => void;
+  onStatusChange?: (
+    status: RunMetadata["status"],
+    info: { day: number; phase: PhaseName; isPaused: boolean; isStopping: boolean }
+  ) => void;
+  phaseDelayMs?: number;
 }
 
 const PHASE_ORDER: readonly PhaseName[] = [
@@ -76,11 +83,14 @@ export class SimulationRunner {
   private readonly rateLimiter?: RateLimiter;
   private readonly onEvent?: (event: SimEvent) => void;
   private readonly onPhaseComplete?: (day: number, phase: PhaseName, state: WorldState) => void;
+  private readonly onStatusChange?: SimulationRunnerOptions["onStatusChange"];
+  private readonly phaseDelayMs: number;
 
   private eventSeq = 1;
   private dayDeaths = 0;
   private dayBirths = 0;
   private paused = false;
+  private stopRequested = false;
   private pauseResolvers: Array<() => void> = [];
   private stepBudget = 0;
   private stepDoneResolvers: Array<() => void> = [];
@@ -96,21 +106,55 @@ export class SimulationRunner {
     this.rateLimiter = opts.rateLimiter;
     this.onEvent = opts.onEvent;
     this.onPhaseComplete = opts.onPhaseComplete;
+    this.onStatusChange = opts.onStatusChange;
+    this.phaseDelayMs = opts.phaseDelayMs ?? 0;
   }
 
   pause(): void {
     this.paused = true;
+    if (this.pauseResolvers.length > 0 || !this.isRunningLoop) {
+      void this.storage.updateRunMetadata({ status: "paused" });
+      this.onStatusChange?.("paused", {
+        day: this.state.day,
+        phase: this.state.phase,
+        isPaused: true,
+        isStopping: this.stopRequested,
+      });
+    }
   }
 
   resume(): void {
     this.paused = false;
     this.stepBudget = 0;
+    void this.storage.updateRunMetadata({ status: "running" });
+    this.onStatusChange?.("running", {
+      day: this.state.day,
+      phase: this.state.phase,
+      isPaused: false,
+      isStopping: this.stopRequested,
+    });
+    const resolvers = this.pauseResolvers.splice(0);
+    for (const r of resolvers) r();
+  }
+
+  requestStop(): void {
+    this.stopRequested = true;
+    this.onStatusChange?.(this.paused ? "paused" : "running", {
+      day: this.state.day,
+      phase: this.state.phase,
+      isPaused: this.paused,
+      isStopping: true,
+    });
     const resolvers = this.pauseResolvers.splice(0);
     for (const r of resolvers) r();
   }
 
   isPaused(): boolean {
     return this.paused;
+  }
+
+  isStopping(): boolean {
+    return this.stopRequested;
   }
 
   async stepOnePhase(): Promise<void> {
@@ -129,18 +173,35 @@ export class SimulationRunner {
     await donePromise;
   }
 
-  private async waitIfPaused(): Promise<void> {
-    if (!this.paused) return;
+  private async waitIfPaused(): Promise<boolean> {
+    if (this.stopRequested) return false;
+    if (!this.paused) return true;
     if (this.stepBudget > 0) {
       this.stepBudget -= 1;
-      return;
+      return true;
     }
-    await new Promise<void>((resolve) => {
-      this.pauseResolvers.push(resolve);
+    let resolved = false;
+    const pausePromise = new Promise<void>((resolve) => {
+      this.pauseResolvers.push(() => {
+        resolved = true;
+        resolve();
+      });
     });
+    await this.storage.updateRunMetadata({ status: "paused" });
+    this.onStatusChange?.("paused", {
+      day: this.state.day,
+      phase: this.state.phase,
+      isPaused: true,
+      isStopping: this.stopRequested,
+    });
+    if (!resolved && this.paused && !this.stopRequested) {
+      await pausePromise;
+    }
+    if (this.stopRequested) return false;
     if (this.paused && this.stepBudget > 0) {
       this.stepBudget -= 1;
     }
+    return true;
   }
 
   private async emit(event: Omit<SimEvent, "id" | "timestamp">): Promise<void> {
@@ -160,6 +221,7 @@ export class SimulationRunner {
   async runDays(targetEndDayExclusive: number, resumeFromLastCompleted?: { day: number; phase: PhaseName }): Promise<{
     completed: boolean;
     budgetStopped: boolean;
+    stopped?: boolean;
     reason?: string;
   }> {
     let startDay = this.state.day;
@@ -179,18 +241,41 @@ export class SimulationRunner {
     this.isRunningLoop = true;
     try {
       for (let day = startDay; day < targetEndDayExclusive; day++) {
-        this.state.day = day;
-        if (day > startDay) {
-          this.rateLimiter?.resetDailyCounter();
-        }
         const firstIdx = day === startDay ? startPhaseIdx : 0;
 
         for (let pIdx = firstIdx; pIdx < PHASE_ORDER.length; pIdx++) {
-          await this.waitIfPaused();
+          const shouldContinue = await this.waitIfPaused();
+          if (!shouldContinue || this.stopRequested) {
+            await this.storage.updateRunMetadata({ status: "paused" });
+            this.onStatusChange?.("paused", {
+              day: this.state.day,
+              phase: this.state.phase,
+              isPaused: true,
+              isStopping: false,
+            });
+            return { completed: false, budgetStopped: false, stopped: true };
+          }
+
+          this.state.day = day;
           const phase = PHASE_ORDER[pIdx]!;
           await this.runSinglePhase(phase);
           const stepResolvers = this.stepDoneResolvers.splice(0);
           for (const r of stepResolvers) r();
+
+          if (this.stopRequested) {
+            await this.storage.updateRunMetadata({
+              status: "paused",
+              lastCompletedDay: day,
+              lastCompletedPhase: phase,
+            });
+            this.onStatusChange?.("paused", {
+              day,
+              phase,
+              isPaused: true,
+              isStopping: false,
+            });
+            return { completed: false, budgetStopped: false, stopped: true };
+          }
 
           if (this.rateLimiter) {
             const budget = this.rateLimiter.isBudgetExhausted();
@@ -200,8 +285,18 @@ export class SimulationRunner {
                 lastCompletedDay: day,
                 lastCompletedPhase: phase,
               });
+              this.onStatusChange?.("budget_stopped", {
+                day,
+                phase,
+                isPaused: false,
+                isStopping: false,
+              });
               return { completed: false, budgetStopped: true, reason: budget.reason };
             }
+          }
+
+          if (this.phaseDelayMs > 0 && !this.stopRequested && !this.paused) {
+            await new Promise((resolve) => setTimeout(resolve, this.phaseDelayMs));
           }
         }
       }
@@ -211,6 +306,12 @@ export class SimulationRunner {
         endedAt: new Date().toISOString(),
         lastCompletedDay: targetEndDayExclusive - 1,
         lastCompletedPhase: "end_of_day",
+      });
+      this.onStatusChange?.("completed", {
+        day: this.state.day,
+        phase: this.state.phase,
+        isPaused: false,
+        isStopping: false,
       });
       return { completed: true, budgetStopped: false };
     } finally {
@@ -280,10 +381,153 @@ export class SimulationRunner {
   }
 
   private async runMorningPhase(): Promise<void> {
-    const adults = Object.values(this.state.agents).filter(
-      (a) => a.alive && a.age >= this.config.EDUCATION_DAYS
-    );
+    const adults = Object.values(this.state.agents)
+      .filter((a) => a.alive && a.age >= this.config.EDUCATION_DAYS)
+      .sort((a, b) => a.numericId - b.numericId);
     const isElectionDay = this.state.day % this.config.TERM_DAYS === 0;
+    const isTr = this.config.SIM_LANGUAGE === "tr";
+
+    // Build shared phase-level system context ONCE so Gemini implicit context caching hits across all adults
+    const daysUntilElection =
+      (this.config.TERM_DAYS - (this.state.day % this.config.TERM_DAYS)) % this.config.TERM_DAYS;
+    const rulesText = isTr
+      ? [
+          `Aldoria dünyasında 3 millet (lyrians, skalians, ventrians) ve 9 bölge vardır (${Object.keys(this.state.regions).join(", ")}).`,
+          `Seçimler her ${this.config.TERM_DAYS} günde bir yapılır (sonraki ${daysUntilElection} gün içinde).`,
+          this.config.LIFESPAN_AWARENESS
+            ? `Aldoria halkı yaklaşık ${this.config.LIFESPAN_DAYS} gün yaşar.`
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : [
+          `World has 3 nations (lyrians, skalians, ventrians) and 9 regions (${Object.keys(this.state.regions).join(", ")}).`,
+          `Elections every ${this.config.TERM_DAYS} days (next in ${daysUntilElection} days).`,
+          this.config.LIFESPAN_AWARENESS
+            ? `People in Aldoria live about ${this.config.LIFESPAN_DAYS} days.`
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+    const partiesText =
+      getActivePartiesDirectory(this.state)
+        .slice(0, 10)
+        .map((p) => `- ${p.id}: ${p.name} (${p.memberIds.length} members) — ${p.manifesto}`)
+        .join("\n") || (isTr ? "(yok)" : "(none)");
+
+    const worldNewsItems = this.state.news.filter(
+      (n) =>
+        n.scope === "world" &&
+        (n.day === (this.state.day === 0 ? 0 : this.state.day - 1) || n.day === this.state.day)
+    );
+    const worldNewsText =
+      worldNewsItems.map((n) => `- [world] ${n.text}`).join("\n") || (isTr ? "(yok)" : "(none)");
+
+    // Precompute phase-level indexes ONCE instead of scanning per agent (critical for large multi-day runs)
+    const deliveredTodayPosts = this.state.posts.filter(
+      (p) => !p.censored && p.deliveredDay === this.state.day
+    );
+    const postIdsByAuthor = new Map<string, Set<string>>();
+    for (const p of this.state.posts) {
+      let set = postIdsByAuthor.get(p.authorId);
+      if (!set) {
+        set = new Set();
+        postIdsByAuthor.set(p.authorId, set);
+      }
+      set.add(p.id);
+    }
+
+    const rosterByRegion = new Map<RegionId, string>();
+    const livingByRegion = new Map<RegionId, Agent[]>();
+    for (const a of Object.values(this.state.agents)) {
+      if (!a.alive) continue;
+      let list = livingByRegion.get(a.region);
+      if (!list) {
+        list = [];
+        livingByRegion.set(a.region, list);
+      }
+      list.push(a);
+    }
+    for (const [rid, list] of livingByRegion) {
+      list.sort((a, b) => a.numericId - b.numericId);
+      const regCountry = this.state.countries[this.state.regions[rid]!.countryId]!;
+      rosterByRegion.set(
+        rid,
+        list
+          .map((a) => {
+            const pName = a.partyId && this.state.parties[a.partyId] ? this.state.parties[a.partyId]!.name : "none";
+            const presFlag = regCountry.presidentId === a.id ? ", PRESIDENT" : "";
+            const stage = a.age < this.config.EDUCATION_DAYS ? "infant" : "adult";
+            return `- ${a.name} (${a.id}, ${a.nation}, age ${a.age}, ${stage}, party: ${pName}${presFlag})`;
+          })
+          .join("\n")
+      );
+    }
+
+    const yesterdayChatByRegion = new Map<RegionId, string>();
+    const yDay = this.state.day - 1;
+    const rawChatByRegion = new Map<RegionId, typeof this.state.localChat>();
+    for (const c of this.state.localChat) {
+      if (c.day !== yDay) continue;
+      let arr = rawChatByRegion.get(c.regionId);
+      if (!arr) {
+        arr = [];
+        rawChatByRegion.set(c.regionId, arr);
+      }
+      arr.push(c);
+    }
+    for (const [rid, arr] of rawChatByRegion) {
+      yesterdayChatByRegion.set(
+        rid,
+        arr
+          .slice(-20)
+          .map((c) => `[R${c.round}] ${c.agentName}: ${c.text}`)
+          .join("\n")
+      );
+    }
+
+    const sharedFeedPosts = getSharedMorningFeedWindow(this.state, this.config, deliveredTodayPosts);
+    const sharedFeedIds = new Set(sharedFeedPosts.map((p) => p.id));
+    const sharedFeedText =
+      sharedFeedPosts
+        .map(
+          (p) =>
+            `- [${p.id}] ${p.authorName} (${p.authorNation}, likes: ${p.likes.length}${p.replyToId ? `, reply to ${p.replyToId}` : ""}): ${p.text}`
+        )
+        .join("\n") || (isTr ? "(henüz gönderi yok)" : "(no posts)");
+
+    const yesterdayWorks = this.state.works.filter((w) => w.day === this.state.day - 1);
+    const hallOfFame = getHallOfFame(this.state, 5).filter(
+      (w) => w.day < this.state.day && w.likes.length > 0 && !yesterdayWorks.some((y) => y.id === w.id)
+    );
+    const worksSectionLines = [
+      ...yesterdayWorks.map(
+        (w) => `- [${w.id}] ${w.authorName} (${w.authorNation}, ${w.kind}, likes: ${w.likes.length}): ${w.text}`
+      ),
+      ...hallOfFame.map(
+        (w) => `- [${w.id}] [Top Day ${w.day}] ${w.authorName} (${w.kind}, likes: ${w.likes.length}): ${w.text}`
+      ),
+    ];
+    const worksText = worksSectionLines.join("\n") || (isTr ? "(yok)" : "(none)");
+
+    const morningSystemPrompt = isTr
+      ? [
+          "Sen Aldoria dünyasının bir vatandaşısın. Asla rolden çıkma. Yalnızca istenen şemaya uygun geçerli JSON döndür.",
+          `\nDünya Kuralları:\n${rulesText}`,
+          `\nAktif Partiler:\n${partiesText}`,
+          `\nDünya Haberleri (Gün ${this.state.day}):\n${worldNewsText}`,
+          `\nOrtak Sosyal Akış (dünden teslim edilen son gönderiler — [pID] ile beğenebilir veya yanıtlayabilirsin):\n${sharedFeedText}`,
+          `\nDünün Kültürel Eserleri ve Seçkin Eserler ([wID] ile beğenebilir, başkanlar adopt_anthem ile marş seçebilir):\n${worksText}`,
+        ].join("\n")
+      : [
+          "You are a citizen of the world of Aldoria. Never break character. Reply ONLY with valid JSON matching the required schema.",
+          `\nWorld Rules:\n${rulesText}`,
+          `\nActive Party Directory:\n${partiesText}`,
+          `\nWorld Headlines (Day ${this.state.day}):\n${worldNewsText}`,
+          `\nShared Public Social Feed (last delivered posts — use [pID] to reply or like):\n${sharedFeedText}`,
+          `\nYesterday's & Notable Cultural Works (use [wID] to like or adopt_anthem):\n${worksText}`,
+        ].join("\n");
 
     // 1. Parallel LLM calls for all living adults
     const results = await Promise.all(
@@ -328,69 +572,69 @@ export class SimulationRunner {
           );
         }
 
-        const roster = Object.values(this.state.agents)
-          .filter((a) => a.alive && a.region === agent.region)
-          .map((a) => {
-            const pName = a.partyId && this.state.parties[a.partyId] ? this.state.parties[a.partyId]!.name : "none";
-            const presFlag = country.presidentId === a.id ? ", PRESIDENT" : "";
-            const stage = a.age < this.config.EDUCATION_DAYS ? "infant" : "adult";
-            return `- ${a.name} (${a.id}, ${a.nation}, age ${a.age}, ${stage}, party: ${pName}${presFlag})`;
-          })
-          .join("\n");
+        const roster = rosterByRegion.get(agent.region) ?? "";
 
-        const yesterdayChat = this.state.localChat
-          .filter((c) => c.regionId === agent.region && c.day === this.state.day - 1)
-          .slice(-20)
-          .map((c) => `[R${c.round}] ${c.agentName}: ${c.text}`)
-          .join("\n") || "(none)";
+        const yesterdayChat =
+          yesterdayChatByRegion.get(agent.region) || (isTr ? "(yok)" : "(none)");
 
-        const newsItems = getNewsForAgent(this.state, reg.id, country.id, this.state.day);
-        const newsText = newsItems.map((n) => `- [${n.scope}] ${n.text}`).join("\n") || "(none)";
+        const localNewsItems = getNewsForAgent(this.state, reg.id, country.id, this.state.day).filter(
+          (n) => n.scope !== "world"
+        );
+        const newsText =
+          localNewsItems.map((n) => `- [${n.scope}] ${n.text}`).join("\n") || (isTr ? "(yok)" : "(none)");
 
-        const partiesText =
-          getActivePartiesDirectory(this.state)
-            .slice(0, 10)
-            .map((p) => `- ${p.id}: ${p.name} (${p.memberIds.length} members) — ${p.manifesto}`)
-            .join("\n") || "(none)";
-
-        const feedPosts = buildAgentFeed(this.state, agent, this.config);
+        const priorityPosts = getAgentPriorityFeedPosts(this.state, agent, 10, {
+          deliveredToday: deliveredTodayPosts,
+          myPostIds: postIdsByAuthor.get(agent.id) ?? new Set(),
+        });
         const feedText =
-          feedPosts
-            .map(
-              (p) =>
-                `- [${p.id}] ${p.authorName} (${p.authorNation}, likes: ${p.likes.length}${p.replyToId ? `, reply to ${p.replyToId}` : ""}): ${p.text}`
-            )
-            .join("\n") || "(no posts)";
+          priorityPosts.length > 0
+            ? priorityPosts
+                .map(
+                  (p) =>
+                    `- [${p.id}] ${p.authorName} (${p.authorNation}, likes: ${p.likes.length}${p.replyToId ? `, reply to ${p.replyToId}` : ""}${sharedFeedIds.has(p.id) ? "" : ", earlier in window"}): ${p.text}`
+                )
+                .join("\n")
+            : isTr
+              ? "(sana doğrudan yanıt veya bahsetme yok; genel akış üstteki sistem bülteninde)"
+              : "(no direct replies or mentions; general feed is in the shared bulletin above)";
 
         const dms = getAgentDeliveredDms(this.state, agent.id);
         const dmsText =
-          dms.map((d) => `- From ${d.fromName} (${d.fromId}): ${d.text}`).join("\n") || "(none)";
+          dms.map((d) => `- From ${d.fromName} (${d.fromId}): ${d.text}`).join("\n") ||
+          (isTr ? "(yok)" : "(none)");
 
-        const noticesText = agent.pendingNotices.join("\n") || "(none)";
+        const noticesText = agent.pendingNotices.join("\n") || (isTr ? "(yok)" : "(none)");
         agent.pendingNotices = [];
 
         let electionBlock = "";
         if (isElectionDay) {
           const cards = buildCandidateCards(this.state, country.id);
-          electionBlock = canVote
-            ? `ELECTION DAY in ${country.name}! Candidates:\n${cards.map((c) => `- ${c.id}: ${c.name} (${c.nation}, party: ${c.partyName ?? "none"}, endorsed by: ${c.endorsedBy.join(", ") || "none"})`).join("\n")}\nYou may cast one {"type": "vote", "candidate_id": "..."} or null to abstain.`
-            : `ELECTION DAY in ${country.name} (you are not eligible to vote here).`;
+          if (isTr) {
+            electionBlock = canVote
+              ? `${country.name} ülkesinde SEÇİM GÜNÜ! Adaylar:\n${cards.map((c) => `- ${c.id}: ${c.name} (${c.nation}, parti: ${c.partyName ?? "bağımsız"}, destekleyenler: ${c.endorsedBy.join(", ") || "yok"})`).join("\n")}\nBir {"type": "vote", "candidate_id": "..."} oyu kullanabilir veya çekimser kalmak için null verebilirsin.`
+              : `${country.name} ülkesinde SEÇİM GÜNÜ (burada oy kullanma hakkın yok).`;
+          } else {
+            electionBlock = canVote
+              ? `ELECTION DAY in ${country.name}! Candidates:\n${cards.map((c) => `- ${c.id}: ${c.name} (${c.nation}, party: ${c.partyName ?? "none"}, endorsed by: ${c.endorsedBy.join(", ") || "none"})`).join("\n")}\nYou may cast one {"type": "vote", "candidate_id": "..."} or null to abstain.`
+              : `ELECTION DAY in ${country.name} (you are not eligible to vote here).`;
+          }
         }
 
         let presidentBlock = "";
         if (isPresident) {
-          presidentBlock = `YOU ARE PRESIDENT of ${country.name}. Decisions remaining this term: ${country.decisionsLeft}. Regions: ${country.regions.join(", ")}.`;
+          presidentBlock = isTr
+            ? `${country.name} BAŞKANI SENSİN. Bu dönem kalan karar hakkın: ${country.decisionsLeft}. Bölgeler: ${country.regions.join(", ")}.`
+            : `YOU ARE PRESIDENT of ${country.name}. Decisions remaining this term: ${country.decisionsLeft}. Regions: ${country.regions.join(", ")}.`;
         }
 
-        const rulesText = [
-          `World has 3 nations (lyrians, skalians, ventrians) and 9 regions (${Object.keys(this.state.regions).join(", ")}).`,
-          `Elections every ${this.config.TERM_DAYS} days (next in ${(this.config.TERM_DAYS - (this.state.day % this.config.TERM_DAYS)) % this.config.TERM_DAYS} days).`,
-          this.config.LIFESPAN_AWARENESS
-            ? `People in Aldoria live about ${this.config.LIFESPAN_DAYS} days.`
-            : "",
-        ]
-          .filter(Boolean)
-          .join(" ");
+        const moveStatusText = canMove
+          ? isTr
+            ? "Bugün herhangi bir bölgeye taşınabilirsin (gün sonunda uygulanır)"
+            : "You MAY move to any region today (applied at end of day)"
+          : isTr
+            ? `Bekleme süresindesin (son taşınma: Gün ${agent.lastMoveDay}, bekleme: ${this.config.MOVE_COOLDOWN_DAYS} gün)`
+            : `On cooldown (last moved day ${agent.lastMoveDay}, cooldown ${this.config.MOVE_COOLDOWN_DAYS} days)`;
 
         const prompt = this.prompts.render("morning", {
           name: agent.name,
@@ -402,7 +646,9 @@ export class SimulationRunner {
           backstory: agent.backstory ?? "",
           worldview: agent.worldview ?? "",
           rules_text: rulesText,
-          diary: agent.diary.map((d) => `Day ${d.day}: ${d.text}`).join("\n") || "(empty)",
+          diary:
+            agent.diary.map((d) => `${isTr ? "Gün" : "Day"} ${d.day}: ${d.text}`).join("\n") ||
+            (isTr ? "(boş)" : "(empty)"),
           roster,
           yesterday_chat: yesterdayChat,
           news: newsText,
@@ -416,12 +662,11 @@ export class SimulationRunner {
           budget: this.config.SOCIAL_MSG_BUDGET,
           limit: this.config.SOCIAL_CHAR_LIMIT,
           like_budget: this.config.LIKE_BUDGET,
-          move_status: canMove
-            ? "You MAY move to any region today (applied at end of day)"
-            : `On cooldown (last moved day ${agent.lastMoveDay}, cooldown ${this.config.MOVE_COOLDOWN_DAYS} days)`,
+          move_status: moveStatusText,
           allowed_actions: allowedList.join(", "),
         });
 
+        const fullPromptForLog = `[SYSTEM]\n${morningSystemPrompt}\n\n[USER]\n${prompt}`;
         const callId = `d${this.state.day}_morning_${agent.id}`;
         const res = await this.llm.generate({
           callId,
@@ -429,6 +674,7 @@ export class SimulationRunner {
           phase: "morning",
           agentId: agent.id,
           purpose: "morning",
+          systemPrompt: morningSystemPrompt,
           prompt,
           schema,
         });
@@ -440,14 +686,15 @@ export class SimulationRunner {
           phase: "morning",
           agentId: agent.id,
           purpose: "morning",
-          promptHash: crypto.createHash("sha256").update(prompt).digest("hex"),
-          ...(this.config.LOG_FULL_PROMPTS ? { prompt } : {}),
+          promptHash: crypto.createHash("sha256").update(fullPromptForLog).digest("hex"),
+          ...(this.config.LOG_FULL_PROMPTS ? { prompt: fullPromptForLog } : {}),
           rawResponse: res.rawText,
           parsedOk: res.success,
           retries: res.retries,
           safetyBlocked: res.safetyBlocked,
           promptTokens: res.promptTokens,
           completionTokens: res.completionTokens,
+          ...(res.cachedTokens ? { cachedTokens: res.cachedTokens } : {}),
           latencyMs: res.latencyMs,
           error: res.error,
         });
@@ -456,8 +703,14 @@ export class SimulationRunner {
       })
     );
 
-    // 2. Resolve actions in deterministic order (sorted by agent numericId)
+    // 2. Resolve actions in deterministic SPEC §5 order across all agents sorted by numericId:
+    // 1. President -> 2. Social -> 3. Parties -> 4. Votes -> 5. Moves & Independence
     results.sort((a, b) => a.agent.numericId - b.agent.numericId);
+
+    const parsedAgents: Array<{
+      agent: Agent;
+      actions: NonNullable<typeof results[number]["res"]["data"]>["actions"];
+    }> = [];
 
     for (const { agent, res } of results) {
       if (!res.success || !res.data) {
@@ -471,40 +724,26 @@ export class SimulationRunner {
         continue;
       }
 
-      const data = res.data;
-      if (data.private_thought) {
+      if (res.data.private_thought) {
         agent.privateThoughts.push({
           day: this.state.day,
           phase: "morning",
-          text: data.private_thought,
+          text: res.data.private_thought,
         });
         await this.emit({
           day: this.state.day,
           phase: "morning",
           actor: agent.id,
           type: "private_thought",
-          payload: { agentId: agent.id, text: data.private_thought },
+          payload: { agentId: agent.id, text: res.data.private_thought },
         });
       }
+      parsedAgents.push({ agent, actions: res.data.actions });
+    }
 
-      // Resolution order (§5): 1. President, 2. Social, 3. Parties, 4. Votes, 5. Moves & Independence
-      const actions = data.actions;
-      const presActions = actions.filter((a) => isPresidentAction(a));
-      const socialActions = actions.filter(
-        (a) => a.type === "post" || a.type === "reply" || a.type === "dm" || a.type === "like"
-      );
-      const partyActions = actions.filter(
-        (a) =>
-          a.type === "found_party" ||
-          a.type === "join_party" ||
-          a.type === "leave_party" ||
-          a.type === "endorse"
-      );
-      const voteActions = actions.filter((a) => a.type === "vote");
-      const moveActions = actions.filter((a) => a.type === "move");
-      const indepActions = actions.filter((a) => a.type === "declare_independence");
-
-      for (const act of presActions) {
+    // Bucket 1: Presidential actions across all agents
+    for (const { agent, actions } of parsedAgents) {
+      for (const act of actions.filter((a) => isPresidentAction(a))) {
         const reg = this.state.regions[agent.region]!;
         const pRes = executePresidentAction(this.state, agent, act, this.config);
         await this.emit({
@@ -568,7 +807,13 @@ export class SimulationRunner {
           );
         }
       }
+    }
 
+    // Bucket 2: Social actions across all agents
+    for (const { agent, actions } of parsedAgents) {
+      const socialActions = actions.filter(
+        (a) => a.type === "post" || a.type === "reply" || a.type === "dm" || a.type === "like"
+      );
       for (const act of socialActions) {
         if (act.type === "post" || act.type === "reply") {
           const replyToId = act.type === "reply" ? act.post_id : null;
@@ -643,7 +888,17 @@ export class SimulationRunner {
           }
         }
       }
+    }
 
+    // Bucket 3: Party actions across all agents
+    for (const { agent, actions } of parsedAgents) {
+      const partyActions = actions.filter(
+        (a) =>
+          a.type === "found_party" ||
+          a.type === "join_party" ||
+          a.type === "leave_party" ||
+          a.type === "endorse"
+      );
       for (const act of partyActions) {
         if (act.type === "found_party") {
           const pRes = foundParty(this.state, agent, act.name, act.manifesto, this.config);
@@ -716,48 +971,56 @@ export class SimulationRunner {
           }
         }
       }
+    }
 
-      if (isElectionDay && voteActions.length > 0) {
+    // Bucket 4: Votes across all agents (note: a region ceded in Bucket 1 reflects current countryId)
+    if (isElectionDay) {
+      for (const { agent, actions } of parsedAgents) {
+        const voteActions = actions.filter((a) => a.type === "vote");
+        if (voteActions.length === 0) continue;
         const voteAct = voteActions[0]!;
-        if (voteAct.type === "vote") {
-          const startRegion = this.state.regions[agent.region]!;
-          const startCountry = this.state.countries[startRegion.countryId]!;
-          if (isEligibleVoter(agent, startCountry.id, this.state, this.config)) {
-            this.state.pendingVotes.push({
+        if (voteAct.type !== "vote") continue;
+        const startRegion = this.state.regions[agent.region]!;
+        const startCountry = this.state.countries[startRegion.countryId]!;
+        if (isEligibleVoter(agent, startCountry.id, this.state, this.config)) {
+          this.state.pendingVotes.push({
+            voterId: agent.id,
+            countryId: startCountry.id,
+            regionId: startRegion.id,
+            candidateId: voteAct.candidate_id,
+          });
+          agent.votesCast.push({
+            day: this.state.day,
+            countryId: startCountry.id,
+            candidateId: voteAct.candidate_id,
+          });
+          await this.emit({
+            day: this.state.day,
+            phase: "morning",
+            actor: agent.id,
+            type: "vote_cast",
+            payload: {
               voterId: agent.id,
               countryId: startCountry.id,
               regionId: startRegion.id,
               candidateId: voteAct.candidate_id,
-            });
-            agent.votesCast.push({
-              day: this.state.day,
-              countryId: startCountry.id,
-              candidateId: voteAct.candidate_id,
-            });
-            await this.emit({
-              day: this.state.day,
-              phase: "morning",
-              actor: agent.id,
-              type: "vote_cast",
-              payload: {
-                voterId: agent.id,
-                countryId: startCountry.id,
-                regionId: startRegion.id,
-                candidateId: voteAct.candidate_id,
-              },
-            });
-          } else {
-            await this.emit({
-              day: this.state.day,
-              phase: "morning",
-              actor: agent.id,
-              type: "action_rejected",
-              payload: { agentId: agent.id, actionType: "vote", reason: "Not eligible to vote" },
-            });
-          }
+            },
+          });
+        } else {
+          await this.emit({
+            day: this.state.day,
+            phase: "morning",
+            actor: agent.id,
+            type: "action_rejected",
+            payload: { agentId: agent.id, actionType: "vote", reason: "Not eligible to vote" },
+          });
         }
       }
+    }
 
+    // Bucket 5: Moves & Independence declarations across all agents
+    for (const { agent, actions } of parsedAgents) {
+      const moveActions = actions.filter((a) => a.type === "move");
       if (moveActions.length > 0) {
         const moveAct = moveActions[0]!;
         if (moveAct.type === "move") {
@@ -822,6 +1085,7 @@ export class SimulationRunner {
         }
       }
 
+      const indepActions = actions.filter((a) => a.type === "declare_independence");
       if (indepActions.length > 0) {
         const indAct = indepActions[0]!;
         if (indAct.type === "declare_independence") {
@@ -870,31 +1134,41 @@ export class SimulationRunner {
     });
     this.state.prngState = prng.getState();
 
-    await Promise.all(
+    const isTr = this.config.SIM_LANGUAGE === "tr";
+    const localChatSystemPrompt = isTr
+      ? "Aldoria dünyasında bir bölge meydanı sohbetindesin. Asla rolden çıkma ve yalnızca istenen şemaya uygun JSON döndür."
+      : "You are in a local town square conversation in Aldoria. Never break character and reply ONLY with valid JSON matching the schema.";
+
+    const perRegionEntries = await Promise.all(
       regionPlans.map(async ({ regionId, occupants, roundOrders }) => {
         const reg = this.state.regions[regionId]!;
         const country = this.state.countries[reg.countryId]!;
+        const regionEntries: WorldState["localChat"] = [];
 
         // Skip local chat LLM calls when a region has <= 1 occupant (Decision #11)
-        if (occupants.length <= 1) return;
+        if (occupants.length <= 1) return regionEntries;
 
         const roster = Object.values(this.state.agents)
           .filter((a) => a.alive && a.region === regionId)
+          .sort((a, b) => a.numericId - b.numericId)
           .map((a) => `- ${a.name} (${a.nation}, age ${a.age}${a.age < this.config.EDUCATION_DAYS ? ", infant" : ""})`)
           .join("\n");
 
         for (let round = 1; round <= this.config.ROUNDS_PER_DAY; round++) {
           const order = roundOrders[round - 1]!;
           for (const agent of order) {
-            const transcript = this.state.localChat
-              .filter((c) => c.day === this.state.day && c.regionId === regionId)
-              .map((c) => `${c.agentName}: ${c.text}`)
-              .join("\n") || "(silence so far)";
+            const transcript =
+              regionEntries.map((c) => `${c.agentName}: ${c.text}`).join("\n") ||
+              (isTr ? "(şimdilik sessizlik)" : "(silence so far)");
 
             const identityExtra =
               agent.age < this.config.EDUCATION_DAYS
-                ? "You are still young and learning about the world."
-                : `Backstory: ${agent.backstory ?? ""}\nWorldview: ${agent.worldview ?? ""}`;
+                ? isTr
+                  ? "Henüz çok gençsin ve dünyayı öğreniyorsun."
+                  : "You are still young and learning about the world."
+                : isTr
+                  ? `Geçmişin: ${agent.backstory ?? ""}\nDünya görüşün: ${agent.worldview ?? ""}`
+                  : `Backstory: ${agent.backstory ?? ""}\nWorldview: ${agent.worldview ?? ""}`;
 
             const prompt = this.prompts.render("local_chat", {
               name: agent.name,
@@ -910,6 +1184,7 @@ export class SimulationRunner {
               limit: this.config.LOCAL_CHAT_CHAR_LIMIT,
             });
 
+            const fullPromptForLog = `[SYSTEM]\n${localChatSystemPrompt}\n\n[USER]\n${prompt}`;
             const callId = `d${this.state.day}_chat_${regionId}_r${round}_${agent.id}`;
             const res = await this.llm.generate({
               callId,
@@ -917,6 +1192,7 @@ export class SimulationRunner {
               phase: "local_chat",
               agentId: agent.id,
               purpose: "local_chat",
+              systemPrompt: localChatSystemPrompt,
               prompt,
               schema: LocalChatOutputSchema,
             });
@@ -928,14 +1204,15 @@ export class SimulationRunner {
               phase: "local_chat",
               agentId: agent.id,
               purpose: "local_chat",
-              promptHash: crypto.createHash("sha256").update(prompt).digest("hex"),
-              ...(this.config.LOG_FULL_PROMPTS ? { prompt } : {}),
+              promptHash: crypto.createHash("sha256").update(fullPromptForLog).digest("hex"),
+              ...(this.config.LOG_FULL_PROMPTS ? { prompt: fullPromptForLog } : {}),
               rawResponse: res.rawText,
               parsedOk: res.success,
               retries: res.retries,
               safetyBlocked: res.safetyBlocked,
               promptTokens: res.promptTokens,
               completionTokens: res.completionTokens,
+              ...(res.cachedTokens ? { cachedTokens: res.cachedTokens } : {}),
               latencyMs: res.latencyMs,
               error: res.error,
             });
@@ -950,7 +1227,7 @@ export class SimulationRunner {
               }
               if (res.data.say && res.data.say.trim().length > 0) {
                 const text = res.data.say.trim().slice(0, this.config.LOCAL_CHAT_CHAR_LIMIT);
-                this.state.localChat.push({
+                const entry: WorldState["localChat"][number] = {
                   day: this.state.day,
                   round,
                   regionId,
@@ -958,7 +1235,8 @@ export class SimulationRunner {
                   agentName: agent.name,
                   nation: agent.nation,
                   text,
-                });
+                };
+                regionEntries.push(entry);
                 // Record into infants' infancyTranscript in this region
                 for (const occ of occupants) {
                   if (occ.id !== agent.id && occ.age < this.config.EDUCATION_DAYS) {
@@ -983,29 +1261,57 @@ export class SimulationRunner {
             }
           }
         }
+        return regionEntries;
       })
     );
+
+    // Append region chats in deterministic sorted regionId order
+    for (const regionEntries of perRegionEntries) {
+      this.state.localChat.push(...regionEntries);
+    }
   }
 
   private async runEveningPhase(): Promise<void> {
-    const living = Object.values(this.state.agents).filter((a) => a.alive);
+    const living = Object.values(this.state.agents)
+      .filter((a) => a.alive)
+      .sort((a, b) => a.numericId - b.numericId);
+    const isTr = this.config.SIM_LANGUAGE === "tr";
+    const eveningSystemPrompt = isTr
+      ? "Sen Aldoria dünyasının bir vatandaşısın. Gün sonu değerlendirmeni karakterinden çıkmadan yalnızca istenen JSON şemasıyla yaz."
+      : "You are a citizen of Aldoria reflecting at the end of the day. Stay in character and reply ONLY with valid JSON matching the schema.";
 
-    await Promise.all(
+    const todayChatByRegion = new Map<RegionId, string[]>();
+    for (const c of this.state.localChat) {
+      if (c.day !== this.state.day) continue;
+      let arr = todayChatByRegion.get(c.regionId);
+      if (!arr) {
+        arr = [];
+        todayChatByRegion.set(c.regionId, arr);
+      }
+      arr.push(`${c.agentName}: ${c.text}`);
+    }
+
+    const eveningResults = await Promise.all(
       living.map(async (agent) => {
         const reg = this.state.regions[agent.region]!;
         const country = this.state.countries[reg.countryId]!;
         const isDying = agent.age === this.config.LIFESPAN_DAYS - 1;
         const isAdult = agent.age >= this.config.EDUCATION_DAYS;
 
-        const todayChat = this.state.localChat
-          .filter((c) => c.day === this.state.day && c.regionId === agent.region)
-          .map((c) => `${c.agentName}: ${c.text}`)
-          .join("\n") || "(quiet day)";
+        const todayChat =
+          todayChatByRegion.get(agent.region)?.join("\n") ||
+          (isTr ? "(sakin bir gün)" : "(quiet day)");
 
-        const daySummary = `Local conversations in ${reg.name}:\n${todayChat}`;
+        const daySummary = isTr
+          ? `${reg.name} bölgesindeki yerel sohbetler:\n${todayChat}`
+          : `Local conversations in ${reg.name}:\n${todayChat}`;
         const identityExtra = isAdult
-          ? `Backstory: ${agent.backstory ?? ""}\nWorldview: ${agent.worldview ?? ""}`
-          : `You are still young (age ${agent.age}). Curriculum: ${country.curriculumText}`;
+          ? isTr
+            ? `Geçmişin: ${agent.backstory ?? ""}\nDünya görüşün: ${agent.worldview ?? ""}`
+            : `Backstory: ${agent.backstory ?? ""}\nWorldview: ${agent.worldview ?? ""}`
+          : isTr
+            ? `Henüz gençsin (${agent.age} günlük). Müfredat: ${country.curriculumText}`
+            : `You are still young (age ${agent.age}). Curriculum: ${country.curriculumText}`;
 
         const prompt = this.prompts.render("evening", {
           name: agent.name,
@@ -1019,13 +1325,22 @@ export class SimulationRunner {
           day_summary: daySummary,
           diary_words: this.config.DIARY_WORDS,
           work_prompt: isAdult
-            ? "Optionally publish one cultural work (poem, song, meme, slogan, or anthem, max 500 chars)."
-            : "Set work to null.",
+            ? isTr
+              ? "İsteğe bağlı olarak bir kültürel eser yayınla (poem, song, meme, slogan veya anthem; en fazla 500 karakter; istemiyorsan work: null)."
+              : "Optionally publish one cultural work (poem, song, meme, slogan, or anthem, max 500 chars)."
+            : isTr
+              ? "work alanını null bırak."
+              : "Set work to null.",
           will_prompt: isDying
-            ? `This is your final day (age ${agent.age}). Write your will (at most ${this.config.WILL_WORDS} words) for the newborn who will take your place.`
-            : "Set will to null.",
+            ? isTr
+              ? `Bu senin son günün (${agent.age} günlüksün). Yerini alacak yenidoğan için vasiyetini (will, en fazla ${this.config.WILL_WORDS} kelime) yaz.`
+              : `This is your final day (age ${agent.age}). Write your will (at most ${this.config.WILL_WORDS} words) for the newborn who will take your place.`
+            : isTr
+              ? "will alanını null bırak."
+              : "Set will to null.",
         });
 
+        const fullPromptForLog = `[SYSTEM]\n${eveningSystemPrompt}\n\n[USER]\n${prompt}`;
         const callId = `d${this.state.day}_evening_${agent.id}`;
         const res = await this.llm.generate({
           callId,
@@ -1033,6 +1348,7 @@ export class SimulationRunner {
           phase: "evening",
           agentId: agent.id,
           purpose: "evening",
+          systemPrompt: eveningSystemPrompt,
           prompt,
           schema: EveningOutputSchema,
         });
@@ -1044,82 +1360,89 @@ export class SimulationRunner {
           phase: "evening",
           agentId: agent.id,
           purpose: "evening",
-          promptHash: crypto.createHash("sha256").update(prompt).digest("hex"),
-          ...(this.config.LOG_FULL_PROMPTS ? { prompt } : {}),
+          promptHash: crypto.createHash("sha256").update(fullPromptForLog).digest("hex"),
+          ...(this.config.LOG_FULL_PROMPTS ? { prompt: fullPromptForLog } : {}),
           rawResponse: res.rawText,
           parsedOk: res.success,
           retries: res.retries,
           safetyBlocked: res.safetyBlocked,
           promptTokens: res.promptTokens,
           completionTokens: res.completionTokens,
+          ...(res.cachedTokens ? { cachedTokens: res.cachedTokens } : {}),
           latencyMs: res.latencyMs,
           error: res.error,
         });
 
-        if (res.success && res.data) {
-          if (res.data.private_thought) {
-            agent.privateThoughts.push({
-              day: this.state.day,
-              phase: "evening",
-              text: res.data.private_thought,
-            });
-          }
-          const diaryText = res.data.diary
-            .trim()
-            .split(/\s+/)
-            .slice(0, this.config.DIARY_WORDS)
-            .join(" ");
-          agent.diary.push({ day: this.state.day, text: diaryText });
+        return { agent, res, isAdult, isDying };
+      })
+    );
+
+    // Apply evening mutations & emit events in deterministic numericId order
+    eveningResults.sort((a, b) => a.agent.numericId - b.agent.numericId);
+
+    for (const { agent, res, isAdult, isDying } of eveningResults) {
+      if (!res.success || !res.data) continue;
+      if (res.data.private_thought) {
+        agent.privateThoughts.push({
+          day: this.state.day,
+          phase: "evening",
+          text: res.data.private_thought,
+        });
+      }
+      const diaryText = res.data.diary
+        .trim()
+        .split(/\s+/)
+        .slice(0, this.config.DIARY_WORDS)
+        .join(" ");
+      agent.diary.push({ day: this.state.day, text: diaryText });
+      await this.emit({
+        day: this.state.day,
+        phase: "evening",
+        actor: agent.id,
+        type: "diary_written",
+        payload: { agentId: agent.id, text: diaryText },
+      });
+
+      if (isAdult && res.data.work) {
+        const wRes = publishWork(
+          this.state,
+          agent,
+          res.data.work.kind,
+          res.data.work.text,
+          this.config
+        );
+        if (wRes.succeeded && wRes.work) {
           await this.emit({
             day: this.state.day,
             phase: "evening",
             actor: agent.id,
-            type: "diary_written",
-            payload: { agentId: agent.id, text: diaryText },
+            type: "work_published",
+            payload: {
+              workId: wRes.work.id,
+              authorId: agent.id,
+              kind: wRes.work.kind,
+              text: wRes.work.text,
+            },
           });
-
-          if (isAdult && res.data.work) {
-            const wRes = publishWork(
-              this.state,
-              agent,
-              res.data.work.kind,
-              res.data.work.text,
-              this.config
-            );
-            if (wRes.succeeded && wRes.work) {
-              await this.emit({
-                day: this.state.day,
-                phase: "evening",
-                actor: agent.id,
-                type: "work_published",
-                payload: {
-                  workId: wRes.work.id,
-                  authorId: agent.id,
-                  kind: wRes.work.kind,
-                  text: wRes.work.text,
-                },
-              });
-            }
-          }
-
-          if (isDying && res.data.will) {
-            const willText = res.data.will
-              .trim()
-              .split(/\s+/)
-              .slice(0, this.config.WILL_WORDS)
-              .join(" ");
-            agent.will = willText;
-            await this.emit({
-              day: this.state.day,
-              phase: "evening",
-              actor: agent.id,
-              type: "will_written",
-              payload: { agentId: agent.id, text: willText },
-            });
-          }
         }
-      })
-    );
+      }
+
+      if (isDying && res.data.will) {
+        const willText = res.data.will
+          .trim()
+          .split(/\s+/)
+          .slice(0, this.config.WILL_WORDS)
+          .join(" ");
+        agent.will = willText;
+        await this.emit({
+          day: this.state.day,
+          phase: "evening",
+          actor: agent.id,
+          type: "will_written",
+          payload: { agentId: agent.id, text: willText },
+        });
+      }
+    }
   }
 
   private async runEndOfDayPhase(): Promise<void> {
@@ -1260,6 +1583,13 @@ export class SimulationRunner {
       return pid ? this.state.agents[pid]?.nation ?? "" : "";
     };
 
+    const allAgents = Object.values(this.state.agents);
+    const deathsCount = allAgents.filter((a) => a.deathDay === this.state.day).length;
+    const birthsCount =
+      this.state.day > 0
+        ? allAgents.filter((a) => a.bornDay === this.state.day).length
+        : 0;
+
     return {
       day: this.state.day,
       totalAlive: living.length,
@@ -1281,8 +1611,8 @@ export class SimulationRunner {
       dmsCount: this.state.dms.filter((d) => d.day === this.state.day).length,
       localChatCount: this.state.localChat.filter((c) => c.day === this.state.day).length,
       worksCount: this.state.works.filter((w) => w.day === this.state.day).length,
-      deathsCount: this.dayDeaths,
-      birthsCount: this.dayBirths,
+      deathsCount,
+      birthsCount,
       regionNationCounts,
     };
   }

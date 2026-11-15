@@ -28,6 +28,17 @@ function nationToCountry(nation: Nation): CountryId {
   return "ventriana";
 }
 
+function resolveRegionId(state: WorldState, rawRegion: string): RegionId | null {
+  const trimmed = rawRegion.trim();
+  if (state.regions[trimmed]) return trimmed;
+  const lower = trimmed.toLowerCase();
+  if (state.regions[lower]) return lower;
+  for (const reg of Object.values(state.regions)) {
+    if (reg.name.toLowerCase() === lower) return reg.id;
+  }
+  return null;
+}
+
 export function isPresidentAction(action: AgentAction): boolean {
   return (
     action.type === "set_curriculum" ||
@@ -78,11 +89,12 @@ export function executePresidentAction(
     }
 
     case "set_border": {
-      const targetRegion = state.regions[action.region];
-      if (!targetRegion || targetRegion.countryId !== country.id) {
+      const regionId = resolveRegionId(state, action.region);
+      const targetRegion = regionId ? state.regions[regionId] : undefined;
+      if (!regionId || !targetRegion || targetRegion.countryId !== country.id) {
         return { succeeded: false, reason: `Region ${action.region} does not belong to ${country.name}` };
       }
-      country.laws.borders[action.region] = action.blocked;
+      country.laws.borders[regionId] = action.blocked;
       return { succeeded: true };
     }
 
@@ -105,8 +117,9 @@ export function executePresidentAction(
     }
 
     case "cede_region": {
-      const targetRegion = state.regions[action.region];
-      if (!targetRegion || targetRegion.countryId !== country.id) {
+      const regionId = resolveRegionId(state, action.region);
+      const targetRegion = regionId ? state.regions[regionId] : undefined;
+      if (!regionId || !targetRegion || targetRegion.countryId !== country.id) {
         return { succeeded: false, reason: `Region ${action.region} does not belong to ${country.name}` };
       }
       if (country.regions.length <= 1) {
@@ -118,7 +131,7 @@ export function executePresidentAction(
       }
       const destCountry = state.countries[destCountryId];
       // Transfer region
-      country.regions = country.regions.filter((r) => r !== action.region);
+      country.regions = country.regions.filter((r) => r !== regionId);
       targetRegion.countryId = destCountryId;
       if (!destCountry.exists) {
         destCountry.exists = true;
@@ -132,16 +145,18 @@ export function executePresidentAction(
           votingRights: { lyrians: true, skalians: true, ventrians: true },
         };
       }
-      destCountry.regions.push(action.region);
-      if (!destCountry.laws.borders[action.region]) {
-        destCountry.laws.borders[action.region] = [];
+      if (!destCountry.regions.includes(regionId)) {
+        destCountry.regions.push(regionId);
       }
-      delete country.laws.borders[action.region];
+      if (!destCountry.laws.borders[regionId]) {
+        destCountry.laws.borders[regionId] = [];
+      }
+      delete country.laws.borders[regionId];
 
       return {
         succeeded: true,
         regionCeded: {
-          regionId: action.region,
+          regionId,
           fromCountry: country.id,
           toCountry: destCountryId,
         },
@@ -149,7 +164,10 @@ export function executePresidentAction(
     }
 
     case "adopt_anthem": {
-      const work = state.works.find((w) => w.id === action.work_id);
+      const workId = action.work_id.trim();
+      const work =
+        state.works.find((w) => w.id === workId) ??
+        state.works.find((w) => w.id.toLowerCase() === workId.toLowerCase());
       if (!work) {
         return { succeeded: false, reason: `Work ${action.work_id} not found` };
       }

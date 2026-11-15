@@ -12,6 +12,7 @@ import type {
 import { handlePresidentDeath } from "../governance/elections.ts";
 import type { PromptLoader } from "../llm/prompt_loader.ts";
 import { removeAgentFromParty } from "../social/parties.ts";
+import { MBTI_BLURBS, MBTI_TYPES } from "./mbti.ts";
 import { generateUniqueName } from "./names.ts";
 import { addNewsItem } from "./news.ts";
 import { SeededPRNG } from "./prng.ts";
@@ -39,7 +40,9 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
     const usedNames = new Set(Object.values(state.agents).map((a) => a.name));
 
     // 1. Increment ages & reset daily counters
-    const livingAtStart = Object.values(state.agents).filter((a) => a.alive);
+    const livingAtStart = Object.values(state.agents)
+      .filter((a) => a.alive)
+      .sort((a, b) => a.numericId - b.numericId);
     for (const agent of livingAtStart) {
       agent.age += 1;
       agent.dailyCounters = {
@@ -132,12 +135,7 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
         const numericId = state.nextIds.agent++;
         const newId = `a${numericId}`;
         const newName = generateUniqueName(agent.nation, world, usedNames, prng);
-        const mbti = prng.pick(
-          Object.keys(
-            (await import("./mbti.ts")).MBTI_BLURBS
-          ) as Array<Agent["mbti"]>
-        );
-        const { MBTI_BLURBS } = await import("./mbti.ts");
+        const mbti = prng.pick(MBTI_TYPES);
 
         const newborn: Agent = {
           id: newId,
@@ -190,17 +188,41 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
   }
 
   // 3. Education -> Worldview formation for agents reaching EDUCATION_DAYS
-  const graduating = Object.values(state.agents).filter(
-    (a) => a.alive && a.age === config.EDUCATION_DAYS && a.worldview === null
-  );
+  const graduating = Object.values(state.agents)
+    .filter((a) => a.alive && a.age === config.EDUCATION_DAYS && a.worldview === null)
+    .sort((a, b) => a.numericId - b.numericId);
 
-  await Promise.all(
+  const isTr = config.SIM_LANGUAGE === "tr";
+  const worldviewSystemPrompt = isTr
+    ? "Aldoria dünyasında yeni reşit olan bir vatandaşsın. Karakterinden hiç çıkma ve yalnızca geçerli JSON döndür."
+    : "You are a citizen of Aldoria who has just come of age. Stay in character and reply ONLY with valid JSON matching the schema.";
+
+  const worldviewResults = await Promise.all(
     graduating.map(async (agent) => {
       const reg = state.regions[agent.region]!;
       const country = state.countries[reg.countryId]!;
       const anthemWork = country.anthemWorkId
         ? state.works.find((w) => w.id === country.anthemWorkId)
         : null;
+
+      const anthemBlock = anthemWork
+        ? isTr
+          ? `Ulusal marş (${anthemWork.kind}): "${anthemWork.text}"\n`
+          : `National anthem (${anthemWork.kind}): "${anthemWork.text}"\n`
+        : "";
+      const infancyHeard =
+        agent.infancyTranscript.length > 0
+          ? agent.infancyTranscript.slice(-20).join("\n")
+          : isTr
+            ? "(sessiz bir çocukluk)"
+            : "(quiet childhood)";
+      const willBlock = agent.will
+        ? isTr
+          ? `Öncülünün sana bıraktığı vasiyet:\n"${agent.will}"`
+          : `Your predecessor's will left to you:\n"${agent.will}"`
+        : isTr
+          ? "Sana bırakılmış bir vasiyet yok."
+          : "You received no predecessor's will.";
 
       const prompt = prompts.render("worldview", {
         name: agent.name,
@@ -210,19 +232,13 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
         age: agent.age,
         mbti_blurb: agent.mbtiBlurb,
         curriculum: country.curriculumText,
-        anthem_block: anthemWork
-          ? `National anthem (${anthemWork.kind}): "${anthemWork.text}"\n`
-          : "",
-        infancy_heard:
-          agent.infancyTranscript.length > 0
-            ? agent.infancyTranscript.slice(-20).join("\n")
-            : "(quiet childhood)",
-        will_block: agent.will
-          ? `Your predecessor's will left to you:\n"${agent.will}"`
-          : "You received no predecessor's will.",
+        anthem_block: anthemBlock,
+        infancy_heard: infancyHeard,
+        will_block: willBlock,
         worldview_words: config.WORLDVIEW_WORDS,
       });
 
+      const fullPromptForLog = `[SYSTEM]\n${worldviewSystemPrompt}\n\n[USER]\n${prompt}`;
       const callId = `d${state.day}_worldview_${agent.id}`;
       const res = await llm.generate({
         callId,
@@ -230,6 +246,7 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
         phase: "rollover",
         agentId: agent.id,
         purpose: "worldview",
+        systemPrompt: worldviewSystemPrompt,
         prompt,
         schema: WorldviewOutputSchema,
       });
@@ -241,14 +258,15 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
         phase: "rollover",
         agentId: agent.id,
         purpose: "worldview",
-        promptHash: crypto.createHash("sha256").update(prompt).digest("hex"),
-        ...(config.LOG_FULL_PROMPTS ? { prompt } : {}),
+        promptHash: crypto.createHash("sha256").update(fullPromptForLog).digest("hex"),
+        ...(config.LOG_FULL_PROMPTS ? { prompt: fullPromptForLog } : {}),
         rawResponse: res.rawText,
         parsedOk: res.success,
         retries: res.retries,
         safetyBlocked: res.safetyBlocked,
         promptTokens: res.promptTokens,
         completionTokens: res.completionTokens,
+        ...(res.cachedTokens ? { cachedTokens: res.cachedTokens } : {}),
         latencyMs: res.latencyMs,
         error: res.error,
       });
@@ -256,19 +274,22 @@ export async function runRolloverPhase(ctx: RolloverContext): Promise<{
       const words = res.success && res.data
         ? res.data.worldview.trim().split(/\s+/).slice(0, config.WORLDVIEW_WORDS).join(" ")
         : "I will observe carefully and judge leaders by their deeds.";
-      agent.worldview = words;
-
-      await emitEvent({
-        id: `ev_wv_${state.day}_${agent.id}`,
-        timestamp: new Date().toISOString(),
-        day: state.day,
-        phase: "rollover",
-        actor: agent.id,
-        type: "worldview_formed",
-        payload: { agentId: agent.id, name: agent.name, worldview: words },
-      });
+      return { agent, words };
     })
   );
+
+  for (const { agent, words } of worldviewResults) {
+    agent.worldview = words;
+    await emitEvent({
+      id: `ev_wv_${state.day}_${agent.id}`,
+      timestamp: new Date().toISOString(),
+      day: state.day,
+      phase: "rollover",
+      actor: agent.id,
+      type: "worldview_formed",
+      payload: { agentId: agent.id, name: agent.name, worldview: words },
+    });
+  }
 
   state.prngState = prng.getState();
   return { deaths, births };

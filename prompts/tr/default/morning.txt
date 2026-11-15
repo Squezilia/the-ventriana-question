@@ -3,7 +3,6 @@ Kişiliğin: {mbti_blurb}
 Geçmişin: {backstory}
 Dünya görüşün: {worldview}
 
-Dünya kuralları: {rules_text}
 Şimdiye kadarki günlüğün:
 {diary}
 
@@ -13,13 +12,10 @@ Dünya kuralları: {rules_text}
 Dün {region} bölgesindeki yerel sohbet:
 {yesterday_chat}
 
-Haberler:
+Yerel/ülke haberleri:
 {news}
 
-Parti rehberi:
-{parties}
-
-Sosyal akışın:
+Sana doğrudan yanıtlar ve bahsetmeler:
 {feed}
 
 Sana gelen özel mesajlar:

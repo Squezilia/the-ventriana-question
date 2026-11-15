@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { SimEvent } from "../../contracts/events.ts";
 import type { WorldState } from "../../contracts/types.ts";
+import { sanitizeConfig } from "../config.ts";
 import { RunStore } from "../storage/run_store.ts";
 
 export interface ReplayBuildOptions {
@@ -40,11 +41,18 @@ export async function buildStaticReplayHtml(opts: ReplayBuildOptions): Promise<s
     if (!metadata) {
       throw new Error(`Run metadata not found in ${opts.runDir}`);
     }
+    const safeMetadata = {
+      ...metadata,
+      config: sanitizeConfig(metadata.config),
+    };
     const stats = store.readAllStats();
     let events = await store.readEvents(0);
     const snapshots: Record<number, WorldState> = {};
 
-    const days = stats.length > 0 ? stats.map((s) => s.day) : [0];
+    const checkpointDays = store.getAvailableCheckpointDays();
+    const daySet = new Set<number>(stats.map((s) => s.day));
+    for (const d of checkpointDays) daySet.add(d);
+    const days = daySet.size > 0 ? [...daySet].sort((a, b) => a - b) : [0];
     for (const d of days) {
       const snap = await store.loadSnapshotForDay(d);
       if (snap) {
@@ -66,7 +74,7 @@ export async function buildStaticReplayHtml(opts: ReplayBuildOptions): Promise<s
 
     const payload = {
       mode: "static" as const,
-      metadata,
+      metadata: safeMetadata,
       snapshots,
       events,
       stats,

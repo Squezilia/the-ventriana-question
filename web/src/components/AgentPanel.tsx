@@ -17,7 +17,9 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   if (!agent) {
     return (
       <div className="rounded-lg border border-slate-800 bg-[#12161f] p-4 text-sm text-slate-400">
-        Click any citizen on the map or in a roster to inspect their profile, diary, and votes.
+        {agentId
+          ? `Citizen ${agentId} was not yet born on Day ${state.day}.`
+          : "Click any citizen on the map or in a roster to inspect their profile, diary, and votes."}
       </div>
     );
   }

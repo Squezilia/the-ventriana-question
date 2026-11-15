@@ -115,6 +115,11 @@ export function loadConfig(rootDir: string = process.cwd()): {
   return { config, world, warnings };
 }
 
+export function sanitizeConfig(config: SimConfig): SimConfig {
+  const { GEMINI_API_KEY: _omitted, ...safe } = config;
+  return safe;
+}
+
 export function validateConfigInvariants(config: SimConfig): string[] {
   const warnings: string[] = [];
   if (config.NUM_AGENTS % 9 !== 0) {

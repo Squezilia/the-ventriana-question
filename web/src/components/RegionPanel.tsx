@@ -23,6 +23,13 @@ export const RegionPanel: React.FC<RegionPanelProps> = ({
   }
 
   const country = state.countries[region.countryId];
+  const borderRule = country.laws.borders[region.id];
+  const borderStatus =
+    borderRule === "all"
+      ? "Border closed: all"
+      : Array.isArray(borderRule) && borderRule.length > 0
+      ? `Border closed: ${borderRule.join(", ")}`
+      : "Open borders";
   const occupants = Object.values(state.agents)
     .filter((a) => a.alive && a.region === region.id)
     .sort((a, b) => b.age - a.age);
@@ -51,9 +58,20 @@ export const RegionPanel: React.FC<RegionPanelProps> = ({
             {region.isCapital ? " · Former Capital" : ""}
           </p>
         </div>
-        <span className="rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-xs text-slate-300">
-          {occupants.length} residents
-        </span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span
+            className={`rounded border px-2 py-0.5 text-[11px] ${
+              borderStatus === "Open borders"
+                ? "border-slate-700 bg-slate-800/50 text-slate-400"
+                : "border-rose-500/40 bg-rose-500/15 text-rose-200"
+            }`}
+          >
+            {borderStatus}
+          </span>
+          <span className="rounded border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-xs text-slate-300">
+            {occupants.length} residents
+          </span>
+        </div>
       </div>
 
       {/* Roster */}

@@ -6,6 +6,7 @@ interface AldoriaMapProps {
   state: WorldState;
   selectedRegionId: RegionId | null;
   selectedAgentId: string | null;
+  educationDays?: number;
   onSelectRegion: (regionId: RegionId) => void;
   onSelectAgent: (agentId: string) => void;
 }
@@ -29,6 +30,7 @@ export const AldoriaMap: React.FC<AldoriaMapProps> = ({
   state,
   selectedRegionId,
   selectedAgentId,
+  educationDays = 5,
   onSelectRegion,
   onSelectAgent,
 }) => {
@@ -196,11 +198,11 @@ export const AldoriaMap: React.FC<AldoriaMapProps> = ({
                   />
                 )}
                 <circle
-                  r={agent.age < 5 ? 5.5 : 7}
+                  r={agent.age < educationDays ? 5.5 : 7}
                   fill={nColor.fill}
                   stroke={nColor.border}
                   strokeWidth={1.5}
-                  opacity={agent.age < 5 ? 0.75 : 1}
+                  opacity={agent.age < educationDays ? 0.75 : 1}
                 />
               </g>
             );

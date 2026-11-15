@@ -19,6 +19,7 @@ export interface LLMGenerateResult<T> {
   rawText: string;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens?: number;
   latencyMs: number;
   retries: number;
   safetyBlocked: boolean;
@@ -45,6 +46,7 @@ export interface LLMCallLogEntry {
   safetyBlocked: boolean;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens?: number;
   latencyMs: number;
   error?: string;
 }

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { LLMClient } from "../../contracts/interfaces.ts";
 import type { PhaseName, RunMetadata } from "../../contracts/types.ts";
-import { loadConfig } from "../config.ts";
+import { loadConfig, sanitizeConfig } from "../config.ts";
 import { initializeWorld } from "../engine/genesis.ts";
 import { hashWorldState } from "../engine/hash.ts";
 import { SimulationRunner } from "../engine/loop.ts";
@@ -14,6 +14,7 @@ import { PromptLoader } from "../llm/prompt_loader.ts";
 import { RateLimiter } from "../llm/rate_limiter.ts";
 import { ReplayLLMClient } from "../llm/replay_client.ts";
 import { createApp } from "../server/app.ts";
+import { SimulationManager } from "../server/run_manager.ts";
 import { computeSpecHash, getGitCommitHash, RunStore } from "../storage/run_store.ts";
 import { buildStaticReplayHtml } from "./replay_build.ts";
 
@@ -87,7 +88,7 @@ program
       promptVariant: config.PROMPT_VARIANT,
       gitCommit: getGitCommitHash(),
       specHash: computeSpecHash(),
-      config,
+      config: sanitizeConfig(config),
       startedAt: new Date().toISOString(),
       endedAt: null,
       status: "initialized",
@@ -119,22 +120,6 @@ program
     const { config, world, warnings } = loadConfig();
     for (const w of warnings) console.warn(`[Config Warning] ${w}`);
 
-    const targetDays = opts.days ? Number(opts.days) : config.SIM_DAYS;
-    const estCallsPerDay = config.NUM_AGENTS * (1 + config.ROUNDS_PER_DAY + 1);
-    console.log(
-      `[Startup] Seed=${config.SIM_SEED}, Days=${targetDays}, Mock=${config.MOCK_LLM}, Est. max ~${estCallsPerDay} calls/day (~${estCallsPerDay * targetDays} total)`
-    );
-
-    const rateLimiter = new RateLimiter({
-      rpmLimit: config.RPM_LIMIT,
-      tpmLimit: config.TPM_LIMIT,
-      maxConcurrency: config.MAX_CONCURRENCY,
-      maxTotalCalls: config.MAX_TOTAL_CALLS,
-      dailyCallBudget: config.DAILY_CALL_BUDGET,
-    });
-    const llm = createLLMClient(config, rateLimiter);
-    const prompts = new PromptLoader(config.SIM_LANGUAGE, config.PROMPT_VARIANT);
-
     let runId = opts.run;
     if (opts.resume && !runId) {
       runId = findLatestRunId(path.resolve(config.OUTPUT_DIR)) ?? undefined;
@@ -144,6 +129,31 @@ program
 
     const runDir = path.resolve(config.OUTPUT_DIR, runId);
     const store = new RunStore(runDir);
+    const existingMeta = opts.resume ? await store.getRunMetadata() : null;
+    const effectiveConfig = existingMeta?.config
+      ? { ...config, SIM_DAYS: existingMeta.config.SIM_DAYS }
+      : config;
+    const targetDays = opts.days ? Number(opts.days) : effectiveConfig.SIM_DAYS;
+    const estCallsPerDay = effectiveConfig.NUM_AGENTS * (1 + effectiveConfig.ROUNDS_PER_DAY + 1);
+    console.log(
+      `[Startup] Seed=${effectiveConfig.SIM_SEED}, Days=${targetDays}, Mock=${effectiveConfig.MOCK_LLM}, Est. max ~${estCallsPerDay} calls/day (~${estCallsPerDay * targetDays} total)`
+    );
+
+    const rateLimiter = new RateLimiter({
+      rpmLimit: effectiveConfig.RPM_LIMIT,
+      tpmLimit: effectiveConfig.TPM_LIMIT,
+      maxConcurrency: effectiveConfig.MAX_CONCURRENCY,
+      maxTotalCalls: effectiveConfig.MAX_TOTAL_CALLS,
+      dailyCallBudget: effectiveConfig.DAILY_CALL_BUDGET,
+    });
+    if (opts.resume) {
+      rateLimiter.seedTotals(store.getLLMUsageSummary());
+    }
+    const llm = createLLMClient(effectiveConfig, rateLimiter);
+    const prompts = new PromptLoader(
+      existingMeta?.language ?? effectiveConfig.SIM_LANGUAGE,
+      existingMeta?.promptVariant ?? effectiveConfig.PROMPT_VARIANT
+    );
 
     let state;
     let resumeFrom: { day: number; phase: PhaseName } | undefined;
@@ -164,7 +174,7 @@ program
         promptVariant: config.PROMPT_VARIANT,
         gitCommit: getGitCommitHash(),
         specHash: computeSpecHash(),
-        config,
+        config: sanitizeConfig(config),
         startedAt: new Date().toISOString(),
         endedAt: null,
         status: "running",
@@ -184,7 +194,7 @@ program
 
     const runner = new SimulationRunner({
       state,
-      config,
+      config: effectiveConfig,
       world,
       llm,
       prompts,
@@ -205,121 +215,77 @@ program
 program
   .command("serve")
   .description("Start the live or replay dashboard server")
-  .option("--live", "Start a live simulation with the dashboard")
-  .option("--run <run_id>", "Run id to serve in replay mode (or new live run id)")
-  .option("--days <n>", "Days to run in live mode")
+  .option("--live", "Start the live simulation control center dashboard")
+  .option("--run <run_id>", "Run id to serve (in --live, immediately creates or resumes this run)")
+  .option("--days <n>", "Days to run when starting/resuming via --run in live mode")
   .action(async (opts: { live?: boolean; run?: string; days?: string }) => {
     const { config, world } = loadConfig();
     const port = config.UI_PORT;
 
     if (opts.live) {
-      const runId = opts.run ?? makeRunId(config.SIM_SEED);
-      const runDir = path.resolve(config.OUTPUT_DIR, runId);
-      const store = new RunStore(runDir);
-      const rateLimiter = new RateLimiter({
-        rpmLimit: config.RPM_LIMIT,
-        tpmLimit: config.TPM_LIMIT,
-        maxConcurrency: config.MAX_CONCURRENCY,
-        maxTotalCalls: config.MAX_TOTAL_CALLS,
-        dailyCallBudget: config.DAILY_CALL_BUDGET,
-      });
-      const llm = createLLMClient(config, rateLimiter);
-      const prompts = new PromptLoader(config.SIM_LANGUAGE, config.PROMPT_VARIANT);
-
-      await store.initRun({
-        runId,
-        seed: config.SIM_SEED,
-        modelId: config.MOCK_LLM ? "mock" : config.MODEL_ID,
-        mockLlm: config.MOCK_LLM,
-        language: config.SIM_LANGUAGE,
-        promptVariant: config.PROMPT_VARIANT,
-        gitCommit: getGitCommitHash(),
-        specHash: computeSpecHash(),
-        config,
-        startedAt: new Date().toISOString(),
-        endedAt: null,
-        status: "running",
-        lastCompletedDay: -1,
-        lastCompletedPhase: null,
-      });
-
-      const state = await initializeWorld({
-        config,
-        world,
-        llm,
-        prompts,
-        emitEvent: (ev) => store.appendEvent(ev),
-        logLLM: (entry) => store.appendLLMCall(entry),
-      });
-      await store.saveSnapshot(0, "rollover", state);
-
-      let started = false;
-      const targetDays = opts.days ? Number(opts.days) : config.SIM_DAYS;
-
-      let serverHandle: ReturnType<typeof createApp>;
-      const runner = new SimulationRunner({
-        state,
-        config,
-        world,
-        llm,
-        prompts,
-        storage: store,
-        rateLimiter,
-        onEvent: (ev) => serverHandle?.broadcastEvent(runId, "running", ev),
-        onPhaseComplete: (day, phase, st) =>
-          serverHandle?.broadcastState(
-            runId,
-            day,
-            phase,
-            "running",
-            st,
-            store.readAllStats(),
-            rateLimiter.getHealth()
-          ),
-      });
-
-      const startSim = () => {
-        if (started) return;
-        started = true;
-        runner
-          .runDays(targetDays)
-          .then((outcome) => {
-            serverHandle?.broadcastState(
-              runId,
-              runner.state.day,
-              runner.state.phase,
-              outcome.budgetStopped ? "budget_stopped" : "completed",
-              runner.state,
-              store.readAllStats(),
-              rateLimiter.getHealth()
-            );
-          })
-          .catch((err) => console.error("[Live Sim Error]", err));
-      };
-
-      serverHandle = createApp({
+      const manager = new SimulationManager({
         mode: "live",
-        store,
-        liveController: {
-          start: startSim,
-          pause: () => runner.pause(),
-          resume: () => runner.resume(),
-          step: () => runner.stepOnePhase(),
-          getHealth: () => rateLimiter.getHealth(),
-        },
+        baseConfig: config,
+        world,
       });
+      const { app } = createApp({ manager });
+      app.listen({ hostname: "127.0.0.1", port });
+      console.log(`Live Control Center running at http://127.0.0.1:${port}`);
 
-      serverHandle.app.listen({ hostname: "127.0.0.1", port });
-      console.log(`Live dashboard running at http://127.0.0.1:${port} (Run ${runId})`);
-      startSim();
+      const handleSignal = async () => {
+        await manager.shutdown();
+        process.exit(0);
+      };
+      process.on("SIGINT", () => void handleSignal());
+      process.on("SIGTERM", () => void handleSignal());
+
+      if (opts.run) {
+        const runDir = path.resolve(config.OUTPUT_DIR, opts.run);
+        const daysNum = opts.days ? Number(opts.days) : undefined;
+        if (fs.existsSync(path.join(runDir, "run.json"))) {
+          manager.setDefaultRunId(opts.run);
+          const details = await manager.getRunDetails(opts.run);
+          if (details.metadata?.status !== "completed") {
+            await manager.resumeRun(opts.run, { days: daysNum });
+            console.log(`Resumed live run ${opts.run}`);
+          } else {
+            console.log(`Focused completed run ${opts.run}`);
+          }
+        } else {
+          await manager.createRun({
+            runId: opts.run,
+            days: daysNum,
+            autoStart: true,
+          });
+          console.log(`Started live run ${opts.run}`);
+        }
+      } else if (opts.days) {
+        const daysNum = Number(opts.days);
+        const created = await manager.createRun({
+          days: daysNum,
+          autoStart: true,
+        });
+        console.log(`Started live run ${created.runId} (${daysNum} days)`);
+      }
     } else {
-      const runId = opts.run ?? findLatestRunId(path.resolve(config.OUTPUT_DIR));
-      if (!runId) throw new Error("No run found. Specify --run <run_id>.");
-      const runDir = path.resolve(config.OUTPUT_DIR, runId);
-      const store = new RunStore(runDir);
-      const serverHandle = createApp({ mode: "replay", store });
-      serverHandle.app.listen({ hostname: "127.0.0.1", port });
-      console.log(`Replay dashboard running at http://127.0.0.1:${port} (Run ${runId})`);
+      const manager = new SimulationManager({
+        mode: "replay",
+        baseConfig: config,
+        world,
+      });
+      if (opts.run) {
+        const runDir = path.resolve(config.OUTPUT_DIR, opts.run);
+        if (!fs.existsSync(runDir)) {
+          throw new Error(`Run '${opts.run}' not found in ${config.OUTPUT_DIR}.`);
+        }
+        manager.setDefaultRunId(opts.run);
+      }
+      const { app } = createApp({ manager });
+      app.listen({ hostname: "127.0.0.1", port });
+      const activeOrLatest = manager.getPreferredRunId();
+      console.log(
+        `Replay dashboard running at http://127.0.0.1:${port}${activeOrLatest ? ` (Run ${activeOrLatest})` : ""}`
+      );
     }
   });
 
